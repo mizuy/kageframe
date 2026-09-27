@@ -204,9 +204,11 @@ def test_level_map_roundtrip(tmp_path, clinical_df) -> None:
     assert loaded.columns == p.level_map.columns
     pseudo = generate(p, seed=1)
     real = generate(p, seed=1, level_map=path)
-    assert set(pseudo["indication"]) == {"L01", "L02", "L03", "L04"}
+    assert set(pseudo["indication"].dropna()) == {"L01", "L02", "L03", "L04"}
     mapped = pseudo["indication"].map(loaded.columns["indication"])
-    assert (mapped == real["indication"]).all()
+    assert (mapped.isna() == real["indication"].isna()).all()
+    observed = real["indication"].notna()
+    assert (mapped[observed] == real["indication"][observed]).all()
 
 
 # --- non-distribution columns --------------------------------------------------------------
@@ -218,9 +220,9 @@ def test_special_columns(clinical_profile) -> None:
     assert isinstance(note, ReasonColumn) and note.type is T.TEXT
     assert isinstance(clinical_profile.column("site"), ConstantColumn)
     assert clinical_profile.column("unused").type is T.EMPTY
-    for name in ("exam_date", "admit_dt", "visit_time"):
-        assert clinical_profile.column(name).type is T.EXCLUDED
-        assert "temporal_not_supported" in warning_codes(clinical_profile, name)
+    assert clinical_profile.column("exam_date").type is T.DATE
+    assert clinical_profile.column("admit_dt").type is T.DATETIME
+    assert clinical_profile.column("visit_time").type is T.TIME
 
 
 def test_user_excluded_column() -> None:

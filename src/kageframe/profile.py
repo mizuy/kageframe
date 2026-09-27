@@ -15,6 +15,7 @@ from .exceptions import KageFrameWarning, PrivacyWarning
 from .marginals import ColumnResult
 from .marginals.categorical import profile_categorical
 from .marginals.numeric import profile_numeric
+from .marginals.temporal import profile_temporal
 from .psd import nearest_correlation
 from .schema import (
     DEFAULT_OPTIONS,
@@ -72,13 +73,6 @@ def _reason(name: str, t: ColumnType, series: pd.Series, n_rows: int,
 def _profile_column(name: str, series: pd.Series, spec: TypeSpec, n_rows: int,
                     options: dict[str, Any]) -> ColumnResult:
     t = spec.type
-    if t in TEMPORAL_TYPES:
-        result = _reason(name, ColumnType.EXCLUDED, series, n_rows,
-                         f"{t.value} columns are not profiled yet (planned for M6)")
-        result.warnings.append(WarningRecord(name, "temporal_not_supported",
-                                             f"{t.value} column excluded: date/time support "
-                                             "is not implemented yet."))
-        return result
     if t is ColumnType.ID:
         n = int(series.notna().sum())
         numeric = pd.api.types.is_numeric_dtype(series.dtype) and not \
@@ -103,6 +97,8 @@ def _profile_column(name: str, series: pd.Series, spec: TypeSpec, n_rows: int,
         return _constant(name, series, n_rows)
     if t is ColumnType.NUMERIC:
         return profile_numeric(name, series, n_rows=n_rows, options=options)
+    if t in TEMPORAL_TYPES:
+        return profile_temporal(name, series, t, n_rows=n_rows, options=options)
     return profile_categorical(name, series, spec, n_rows=n_rows, options=options)
 
 

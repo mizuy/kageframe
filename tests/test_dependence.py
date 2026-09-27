@@ -21,12 +21,8 @@ from kageframe.latent import (
 from kageframe.schema import LatentLabel
 
 
-def _label_name(label: LatentLabel) -> str:
-    return label.column if label.level is None else f"{label.column}[{label.level}]"
-
-
 def _latent(profile) -> tuple[list[str], np.ndarray]:
-    labels = [_label_name(lb) for lb in profile.latent_labels()]
+    labels = [lb.key for lb in profile.latent_labels()]
     return labels, np.array(profile.dependence.latent.matrix, dtype=float)
 
 
