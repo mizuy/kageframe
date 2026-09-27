@@ -781,10 +781,12 @@ class LevelMap:
         return cls(out)
 
     def save(self, path: str | Path) -> None:
+        """Write the map as JSON. Keep the file local (``*.local.json`` is gitignored)."""
         Path(path).write_text(_dumps(self.to_dict()), encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path) -> LevelMap:
+        """Read a map written by :meth:`save` or :meth:`Profile.save_level_map`."""
         return cls.from_dict(_loads(Path(path).read_text(encoding="utf-8")))
 
 
@@ -845,6 +847,18 @@ def _loads(text: str) -> Any:
 
 @dataclass
 class Profile:
+    """Aggregate statistics of a DataFrame: everything :func:`generate` needs, no rows.
+
+    Contains, per column, the type, missing rate and marginal distribution (blurred
+    quantile grids, level frequencies), plus the latent correlation matrices and the
+    warnings raised while profiling. Real row values, true minima/maxima, merged rare
+    level names, identifiers and free text are never stored.
+
+    Create it with :func:`profile_dataframe`; share it with :meth:`save` /
+    :func:`load_profile`. ``level_map`` (pseudonym -> real name) lives only in memory
+    and is written separately by :meth:`save_level_map`.
+    """
+
     n_rows: int
     columns: list[ColumnProfile]
     options: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_OPTIONS))
@@ -860,6 +874,7 @@ class Profile:
     # -- structure ---------------------------------------------------------
 
     def column(self, name: str) -> ColumnProfile:
+        """The profile of column ``name`` (``KeyError`` if unknown)."""
         for col in self.columns:
             if col.name == name:
                 return col
@@ -867,13 +882,16 @@ class Profile:
 
     @property
     def column_names(self) -> list[str]:
+        """All profiled columns in the original order."""
         return [c.name for c in self.columns]
 
     @property
     def output_columns(self) -> list[str]:
+        """Columns that :func:`generate` returns (free text and excluded columns dropped)."""
         return [c.name for c in self.columns if c.in_output]
 
     def latent_labels(self) -> list[LatentLabel]:
+        """Labels of the rows/columns of the correlation matrices."""
         return latent_labels(self.columns)
 
     def validate(self) -> None:
@@ -909,6 +927,7 @@ class Profile:
     # -- serialization -----------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
+        """The JSON-compatible representation (without the level map)."""
         return {
             "schema_version": self.schema_version,
             "kageframe_version": self.kageframe_version,
@@ -921,6 +940,7 @@ class Profile:
 
     @classmethod
     def from_dict(cls, d: Any) -> Profile:
+        """Build and validate a profile; raises :class:`ProfileSchemaError` if invalid."""
         d = _require_mapping(d, "profile")
         if d.get("kind") == LEVEL_MAP_KIND:
             raise ProfileSchemaError("this file is a level map, not a profile; "
@@ -949,10 +969,12 @@ class Profile:
         )
 
     def to_json(self) -> str:
+        """Deterministic JSON text: the same DataFrame always gives the same string."""
         return _dumps(self.to_dict())
 
     @classmethod
     def from_json(cls, text: str) -> Profile:
+        """Parse and validate JSON text written by :meth:`to_json`."""
         return cls.from_dict(_loads(text))
 
     def save(self, path: str | Path) -> None:
@@ -961,6 +983,7 @@ class Profile:
 
     @classmethod
     def load(cls, path: str | Path) -> Profile:
+        """Read a profile written by :meth:`save`."""
         return cls.from_json(Path(path).read_text(encoding="utf-8"))
 
     def save_level_map(self, path: str | Path) -> None:
@@ -972,4 +995,5 @@ class Profile:
 
 
 def load_profile(path: str | Path) -> Profile:
+    """Read and validate a profile JSON file (same as :meth:`Profile.load`)."""
     return Profile.load(path)

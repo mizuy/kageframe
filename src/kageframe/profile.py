@@ -161,9 +161,40 @@ def profile_dataframe(
 ) -> Profile:
     """Profile ``df`` into aggregate statistics (no row-level data).
 
-    Level names are stored as-is except for columns listed in ``pseudonymize`` (or with
-    ``"pseudonymize": True`` in ``types``); their pseudonym map is kept only in memory as
-    ``profile.level_map`` and must be saved separately with ``save_level_map``.
+    Parameters
+    ----------
+    df:
+        The real DataFrame. It is only read; nothing row-level is kept.
+    types:
+        Per-column overrides, e.g. ``{"stage": {"type": "ordinal", "levels": ["I", "II",
+        "III"]}, "ecog": "ordinal", "memo": "excluded"}``. Columns not listed are
+        inferred (see :func:`infer_types`). A binary override may give ``levels`` as
+        ``[negative, positive]``; ``"pseudonymize": True/False`` overrides the list below.
+    pseudonymize:
+        String categorical columns whose level names are replaced by ``L01``, ``L02``, ...
+        Off by default. The pseudonym map is kept only in memory as ``profile.level_map``;
+        write it with :meth:`Profile.save_level_map` and keep that file local.
+    rare_threshold:
+        ``k`` for categories: nominal levels with fewer rows are merged into ``Other``
+        (or folded into the most frequent level if ``Other`` would still be rare).
+    min_tail_count:
+        ``k`` for distributions: grid end points (stored as ``min``/``max``) are the
+        ``k/n`` and ``1 - k/n`` quantiles, never the true extremes.
+    quantile_grid:
+        Maximum number of points of each reconstruction grid (at most ``n / k``).
+    discrete_max_levels:
+        Integer columns with at most this many distinct values (each seen ``k`` times)
+        store their exact support and probabilities.
+    max_levels, ordinal_max_levels:
+        Type-inference limits for string categories and integer codes.
+    min_pair_count:
+        Pairs of columns observed together in fewer rows get correlation 0 (warning).
+
+    Returns
+    -------
+    Profile
+        Warnings raised while profiling are emitted (``PrivacyWarning`` for privacy
+        relevant ones) and also recorded in ``profile.warnings``.
     """
     n_rows = len(df)
     if n_rows == 0:

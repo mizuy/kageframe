@@ -17,6 +17,13 @@ from .exceptions import PrivacyWarning, TypeInferenceWarning, TypeSpecError
 
 
 class ColumnType(str, Enum):
+    """Column types. The first seven are profiled; the rest describe special columns.
+
+    ``id`` columns are regenerated as new sequential values, ``text`` and ``excluded``
+    columns are dropped from the output, ``constant`` and ``empty`` columns are
+    reproduced as a single value / all missing.
+    """
+
     NUMERIC = "numeric"
     BINARY = "binary"
     ORDINAL = "ordinal"
