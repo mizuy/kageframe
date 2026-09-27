@@ -33,7 +33,6 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "ordinal_max_levels": 10,
     "datetime_mode": "split",
     "correlation_estimator": "normal_scores_corrected",
-    "pseudonymize_codes": False,
 }
 
 Scalar = str | int | float | bool

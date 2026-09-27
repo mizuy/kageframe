@@ -28,9 +28,23 @@ clinmock.infer_types(df)                       # {"age": "numeric", "ecog": "ord
 ```python
 types = {"stage": {"type": "ordinal", "levels": ["I", "II", "III", "IV"]},
          "ecog": "ordinal"}
-resolution = clinmock.resolve_types(df, types, keep_level_names=["stage"])
+resolution = clinmock.resolve_types(df, types, pseudonymize=["hospital", "doctor"])
 ```
+
+## level 名の仮名化（opt-in）
+
+文字列カテゴリの level 名は、既定ではそのまま profile に保存します。仮名（`L01`, `L02`, …）に置き換えたい列は、次のどちらかで明示的に指定してください。両方で指定した場合は列ごとの指定が優先されます。
+
+- `pseudonymize=["hospital", "doctor"]`
+- 列ごとの指定: `types={"hospital": {"type": "nominal", "pseudonymize": True}}`
+
+整数コードや bool/0-1 の列は仮名化しません（指定しても警告を出して無視します）。
+
+仮名化するかどうかを clinmock が自動で決めることはなく、判断はユーザーに委ねます。ただし、仮名化していない文字列カテゴリ列が次のどちらかに当てはまる場合は `PrivacyWarning`（code `consider_pseudonymize`）を出すので、内容を確認してください。
+
+- 列名が識別子・人・施設を示す典型パターンに一致する（id, name, hospital, doctor, facility, site, center, institution, 病院, 医師 など）
+- 値のほぼすべて（90% 以上）が行ごとに異なる
 
 ## Profile JSON
 
-スキーマ version は `0.1.0` です。仕様は `docs/`（プロジェクトの計画書 §3）にあります。level 名の仮名と実名の対応表（`LevelMap`）は profile JSON には含めません。`profile.save_level_map("level_map.local.json")` で別ファイルに書き出し、ローカルだけで使ってください。`*.local.json` は `.gitignore` 済みです。
+スキーマ version は `0.1.0` です。仕様は `docs/`（プロジェクトの計画書 §3）にあります。仮名と実名の対応表（`LevelMap`）は profile JSON には含めません。`profile.save_level_map("level_map.local.json")` で別ファイルに書き出し、ローカルだけで使ってください。`*.local.json` は `.gitignore` 済みです。

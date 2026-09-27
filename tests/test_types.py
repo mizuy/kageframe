@@ -127,10 +127,8 @@ def test_string_identifier_and_text():
     assert infer(high_card_short) is T.TEXT
 
 
-def test_sensitive_column_name_warns():
-    codes = infer_warn_codes(["Dr. A", "Dr. B", "Dr. C"] * 5, name="doctor_name")
-    assert codes == ["sensitive_column_name"]
-    assert infer_warn_codes(["a", "b", "c"] * 5, name="indication") == []
+def test_inference_itself_never_warns_about_pseudonymization():
+    assert infer_warn_codes(["Dr. A", "Dr. B", "Dr. C"] * 5, name="doctor") == []
 
 
 def test_mixed_object_values_do_not_crash():
@@ -190,7 +188,8 @@ def test_override_levels_must_cover_data(df):
         ({"type": "nominal", "levels": "abc"}, "must be a list"),
         ({"type": "nominal", "levels": ["a", "a"]}, "duplicates"),
         ({"type": "binary", "levels": ["M", "F", "X"]}, "exactly 2"),
-        ({"type": "nominal", "keep_level_names": "yes"}, "must be a bool"),
+        ({"type": "nominal", "pseudonymize": "yes"}, "must be a bool"),
+        ({"type": "nominal", "keep_level_names": True}, "unknown override keys"),
     ],
 )
 def test_invalid_overrides(df, override, match):
@@ -214,7 +213,7 @@ def test_unknown_columns_rejected(df):
     with pytest.raises(TypeSpecError, match="unknown columns"):
         resolve_types(df, {"nope": "numeric"})
     with pytest.raises(TypeSpecError, match="unknown columns"):
-        resolve_types(df, keep_level_names=["nope"])
+        resolve_types(df, pseudonymize=["nope"])
 
 
 def test_column_name_checks():
@@ -224,17 +223,89 @@ def test_column_name_checks():
         resolve_types(pd.DataFrame([[1, 2]]))
 
 
-def test_keep_level_names(df):
-    res = resolve_types(df, {"sex": {"type": "binary", "keep_level_names": False}},
-                        keep_level_names=["sex", "stage"])
-    assert res.specs["sex"].keep_level_names is False
-    assert res.specs["stage"].keep_level_names is True
-    assert res.specs["code"].keep_level_names is None
-    res_all = resolve_types(df, keep_level_names="all")
-    assert all(s.keep_level_names for s in res_all.specs.values())
-    assert any(w.code == "level_names_kept" for w in res_all.warnings)
-    with pytest.raises(TypeSpecError):
-        resolve_types(df, keep_level_names="sex")
+# -- pseudonymization (opt-in) ----------------------------------------------------
+
+
+def codes_for(res, column):
+    return [w.code for w in res.warnings if w.column == column]
+
+
+def test_level_names_are_kept_by_default(df):
+    res = resolve_types(df)
+    assert not any(s.pseudonymize for s in res.specs.values())
+
+
+def test_pseudonymize_list_and_override(df):
+    res = resolve_types(df, {"stage": {"type": "ordinal", "levels": ["I", "II", "III", "IV"],
+                                       "pseudonymize": True}},
+                        pseudonymize=["sex"])
+    assert res.specs["sex"].pseudonymize is True
+    assert res.specs["stage"].pseudonymize is True
+    assert res.specs["code"].pseudonymize is False
+    res = resolve_types(df, {"sex": {"type": "binary", "pseudonymize": False}},
+                        pseudonymize=["sex"])
+    assert res.specs["sex"].pseudonymize is False
+
+
+def test_pseudonymize_argument_validation(df):
+    with pytest.raises(TypeSpecError, match="list of column names"):
+        resolve_types(df, pseudonymize="sex")
+    with pytest.raises(TypeSpecError, match="only valid"):
+        resolve_types(df, {"val": {"type": "numeric", "pseudonymize": True}})
+
+
+def test_codes_and_booleans_are_never_pseudonymized():
+    frame = pd.DataFrame({"code": [1, 2, 3] * 10, "flag01": [0, 1] * 15,
+                          "flag": [True, False] * 15,
+                          "cat": pd.Categorical([1, 2, 3] * 10)})
+    res = resolve_types(frame, {"cat": "nominal"}, pseudonymize=list(frame.columns))
+    for name in frame.columns:
+        assert res.specs[name].pseudonymize is False
+        assert codes_for(res, name)[-1] == "pseudonymize_ignored"
+
+
+def test_pseudonymize_on_non_categorical_inferred_column_is_ignored_with_warning(df):
+    res = resolve_types(df, pseudonymize=["val"])
+    assert res.specs["val"].pseudonymize is False
+    assert codes_for(res, "val") == ["pseudonymize_ignored"]
+
+
+@pytest.mark.parametrize("name", ["hospital", "doctor", "facility_code", "site", "center",
+                                  "institution", "hospitalName", "attending_dr", "siteID",
+                                  "patient_name", "病院名", "担当医師", "ward"])
+def test_sensitive_names_warn_to_consider_pseudonymization(name):
+    frame = pd.DataFrame({name: ["a", "b", "c"] * 10})
+    res = resolve_types(frame)
+    assert codes_for(res, name) == ["consider_pseudonymize"]
+    assert res.specs[name].pseudonymize is False
+    assert all(w.category is PrivacyWarning for w in res.warnings)
+    assert codes_for(resolve_types(frame, pseudonymize=[name]), name) == []
+
+
+@pytest.mark.parametrize("name", ["indication", "stage", "sex", "idea", "consideration",
+                                  "valid_flag", "insider"])
+def test_ordinary_names_do_not_warn(name):
+    frame = pd.DataFrame({name: ["a", "b", "c"] * 10})
+    assert codes_for(resolve_types(frame), name) == []
+
+
+def test_high_cardinality_string_categorical_warns():
+    frame = pd.DataFrame({"x": [f"v{i}" for i in range(30)]})
+    res = resolve_types(frame)
+    assert res.specs["x"].type is T.NOMINAL
+    assert codes_for(res, "x") == ["consider_pseudonymize"]
+    assert "distinct value" in res.warnings[0].message
+
+
+def test_sensitive_name_on_integer_codes_does_not_warn():
+    frame = pd.DataFrame({"hospital": [1, 2, 3] * 10})
+    assert "consider_pseudonymize" not in codes_for(resolve_types(frame), "hospital")
+
+
+def test_fixture_warnings(clinical_df):
+    res = resolve_types(clinical_df)
+    assert not any(w.code == "consider_pseudonymize" for w in res.warnings)
+    assert not any(s.pseudonymize for s in res.specs.values())
 
 
 def test_infer_types_emits_python_warnings(df):

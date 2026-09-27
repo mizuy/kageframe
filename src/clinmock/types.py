@@ -6,7 +6,7 @@ import datetime as _dt
 import re
 import warnings
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Literal
 
@@ -51,11 +51,28 @@ _DATETIME_RE = re.compile(
     r"(Z|[+-]\d{2}:?\d{2})?\s*$"
 )
 _TIME_RE = re.compile(r"^\s*([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d(\.\d+)?)?\s*$")
-_SENSITIVE_NAME_RE = re.compile(
-    r"((^|_)(id|mrn|patient|pt|kanja|name|shimei|address|phone|tel|email|comment|memo|note|"
-    r"free)(_|$)|番号|氏名|住所|電話|備考|所見|コメント)",
-    re.IGNORECASE,
+# Column names that suggest the levels identify people or institutions. Short tokens must
+# match a whole name token (split on non-alphanumerics and camelCase); long ones may appear
+# anywhere in the name.
+_SENSITIVE_NAME_TOKENS = frozenset({"id", "ids", "dr", "md", "mrn", "pt", "ptid", "site",
+                                    "ward", "dept", "staff", "kanja", "shimei", "byoin"})
+_SENSITIVE_NAME_SUBSTRINGS = (
+    "name", "hospital", "doctor", "physician", "surgeon", "nurse", "facility", "institution",
+    "center", "centre", "clinic", "department", "operator", "patient",
+    "病院", "施設", "医師", "医療機関", "担当", "氏名", "名前", "患者", "診療科", "病棟",
+    "センター",
 )
+_NAME_TOKEN_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+HIGH_CARDINALITY_RATIO = 0.9
+
+
+def sensitive_column_name(name: str) -> bool:
+    """True if the column name matches a typical identifier / person / institution pattern."""
+    lowered = name.lower()
+    if any(s in lowered for s in _SENSITIVE_NAME_SUBSTRINGS):
+        return True
+    tokens = {t.lower() for t in _NAME_TOKEN_RE.findall(name)}
+    return not tokens.isdisjoint(_SENSITIVE_NAME_TOKENS)
 
 
 @dataclass(frozen=True)
@@ -64,12 +81,13 @@ class TypeSpec:
 
     ``levels`` is set only when known at resolution time: user-supplied levels,
     categories of an ordered Categorical, or sorted codes of an integer ordinal.
-    ``keep_level_names=None`` means the default (pseudonymize string levels).
+    ``pseudonymize`` is True only when the user requested it for a string categorical;
+    level names are kept by default.
     """
 
     type: ColumnType
     levels: tuple[Any, ...] | None = None
-    keep_level_names: bool | None = None
+    pseudonymize: bool = False
     source: Literal["override", "inferred"] = "inferred"
     reason: str = ""
 
@@ -245,18 +263,12 @@ def infer_column_type(
         return spec(temporal, "strings parseable as date/time"), warns
 
     n_unique, unique_ratio, avg_len, frac_space = _string_profile(values)
-    sensitive_name = bool(_SENSITIVE_NAME_RE.search(name))
     if n_unique <= max_levels:
         if avg_len > 50 and unique_ratio >= 0.5:
             warns.append(TypeWarning(name, "free_text_excluded",
                                      "long, mostly unique strings look like free text; "
                                      "excluded from the output.", PrivacyWarning))
             return spec(ColumnType.TEXT, "long mostly-unique strings"), warns
-        if sensitive_name:
-            warns.append(TypeWarning(
-                name, "sensitive_column_name",
-                "column name suggests identifying information but the column was profiled as "
-                "categorical; review it or exclude it via types=.", PrivacyWarning))
         t = ColumnType.BINARY if n_unique == 2 else ColumnType.NOMINAL
         return spec(t, f"{n_unique} distinct strings"), warns
 
@@ -276,7 +288,7 @@ def infer_column_type(
 # overrides
 # ---------------------------------------------------------------------------
 
-_OVERRIDE_KEYS = {"type", "levels", "keep_level_names"}
+_OVERRIDE_KEYS = {"type", "levels", "pseudonymize"}
 
 
 def _parse_type_name(value: Any, column: str) -> ColumnType:
@@ -291,7 +303,8 @@ def _parse_type_name(value: Any, column: str) -> ColumnType:
     return t
 
 
-def _parse_override(column: str, value: Any) -> TypeSpec:
+def _parse_override(column: str, value: Any) -> tuple[TypeSpec, bool | None]:
+    """Return the override spec and its explicit ``pseudonymize`` setting (None if absent)."""
     if isinstance(value, Mapping):
         unknown = set(value) - _OVERRIDE_KEYS
         if unknown:
@@ -300,9 +313,9 @@ def _parse_override(column: str, value: Any) -> TypeSpec:
             raise TypeSpecError(f"[{column}] override dict needs a 'type' key")
         t = _parse_type_name(value["type"], column)
         levels = value.get("levels")
-        keep = value.get("keep_level_names")
+        pseudonymize = value.get("pseudonymize")
     else:
-        t, levels, keep = _parse_type_name(value, column), None, None
+        t, levels, pseudonymize = _parse_type_name(value, column), None, None
 
     if levels is not None:
         if t not in CATEGORICAL_TYPES:
@@ -316,10 +329,14 @@ def _parse_override(column: str, value: Any) -> TypeSpec:
             raise TypeSpecError(f"[{column}] binary 'levels' must have exactly 2 entries")
         if len(levels) < 2:
             raise TypeSpecError(f"[{column}] 'levels' must have at least 2 entries")
-    if keep is not None and not isinstance(keep, bool):
-        raise TypeSpecError(f"[{column}] 'keep_level_names' must be a bool")
-    return TypeSpec(type=t, levels=levels, keep_level_names=keep, source="override",
-                    reason="user override")
+    if pseudonymize is not None:
+        if not isinstance(pseudonymize, bool):
+            raise TypeSpecError(f"[{column}] 'pseudonymize' must be a bool")
+        if pseudonymize and t not in CATEGORICAL_TYPES:
+            raise TypeSpecError(f"[{column}] 'pseudonymize' is only valid for "
+                                "binary/ordinal/nominal")
+    return TypeSpec(type=t, levels=levels, source="override", reason="user override"), \
+        pseudonymize
 
 
 def _level_key(value: Any) -> Any:
@@ -346,11 +363,9 @@ def _check_override_against_data(column: str, spec: TypeSpec, series: pd.Series)
         elif t is ColumnType.ORDINAL:
             dtype = series.dtype
             if isinstance(dtype, pd.CategoricalDtype) and dtype.ordered:
-                spec = TypeSpec(t, tuple(dtype.categories.tolist()), spec.keep_level_names,
-                                spec.source, spec.reason)
+                spec = replace(spec, levels=tuple(dtype.categories.tolist()))
             elif pd.api.types.is_numeric_dtype(dtype) and not pd.api.types.is_bool_dtype(dtype):
-                spec = TypeSpec(t, tuple(sorted(observed)), spec.keep_level_names,
-                                spec.source, spec.reason)
+                spec = replace(spec, levels=tuple(sorted(observed)))
             else:
                 raise TypeSpecError(f"[{column}] ordinal override on non-numeric values needs "
                                     "explicit 'levels' (the order is never guessed)")
@@ -364,20 +379,60 @@ def _check_override_against_data(column: str, spec: TypeSpec, series: pd.Series)
     return spec
 
 
-def _normalize_keep_level_names(
-    keep_level_names: Sequence[str] | Literal["all"] | None, columns: Sequence[str]
-) -> set[str]:
-    if keep_level_names is None:
+def _normalize_pseudonymize(pseudonymize: Sequence[str] | None,
+                            columns: Sequence[str]) -> set[str]:
+    if pseudonymize is None:
         return set()
-    if isinstance(keep_level_names, str):
-        if keep_level_names != "all":
-            raise TypeSpecError("keep_level_names must be a list of column names or 'all'")
-        return set(columns)
-    names = set(keep_level_names)
+    if isinstance(pseudonymize, (str, bytes)) or not isinstance(pseudonymize, Sequence):
+        raise TypeSpecError("pseudonymize must be a list of column names")
+    names = set(pseudonymize)
     unknown = names - set(columns)
     if unknown:
-        raise TypeSpecError(f"keep_level_names refers to unknown columns: {sorted(unknown)}")
+        raise TypeSpecError(f"pseudonymize refers to unknown columns: {sorted(unknown)}")
     return names
+
+
+def has_string_levels(series: pd.Series) -> bool:
+    """True unless the values are numbers or booleans (codes are never pseudonymized)."""
+    values = _nonmissing(series)
+    if pd.api.types.is_bool_dtype(series.dtype) or _all_instances(values, (bool, np.bool_)):
+        return False
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        categories = series.dtype.categories
+        return not (pd.api.types.is_numeric_dtype(categories.dtype)
+                    or pd.api.types.is_bool_dtype(categories.dtype))
+    return not pd.api.types.is_numeric_dtype(series.dtype)
+
+
+def _apply_pseudonymize(name: str, spec: TypeSpec, series: pd.Series,
+                        requested: bool) -> tuple[TypeSpec, list[TypeWarning]]:
+    """Set ``spec.pseudonymize`` and collect warnings; the user makes the final call."""
+    warns: list[TypeWarning] = []
+    is_string_categorical = spec.type in CATEGORICAL_TYPES and has_string_levels(series)
+    if requested:
+        if is_string_categorical:
+            return replace(spec, pseudonymize=True), warns
+        why = ("integer codes and booleans are never pseudonymized"
+               if spec.type in CATEGORICAL_TYPES
+               else f"column type is {spec.type.value}, not a string categorical")
+        warns.append(TypeWarning(name, "pseudonymize_ignored",
+                                 f"pseudonymize requested but ignored: {why}."))
+        return spec, warns
+
+    if is_string_categorical:
+        values = _nonmissing(series)
+        reasons = []
+        if sensitive_column_name(name):
+            reasons.append("the column name matches an identifier/person/institution pattern")
+        if len(values) and values.nunique() / len(values) >= HIGH_CARDINALITY_RATIO:
+            reasons.append("almost every row has a distinct value")
+        if reasons:
+            warns.append(TypeWarning(
+                name, "consider_pseudonymize",
+                f"level names will be stored as-is, but {' and '.join(reasons)}; consider "
+                f"pseudonymize=[{name!r}] or excluding the column via types=.",
+                PrivacyWarning))
+    return spec, warns
 
 
 def _check_columns(df: pd.DataFrame) -> list[str]:
@@ -395,7 +450,7 @@ def resolve_types(
     df: pd.DataFrame,
     types: Mapping[str, Any] | None = None,
     *,
-    keep_level_names: Sequence[str] | Literal["all"] | None = None,
+    pseudonymize: Sequence[str] | None = None,
     max_levels: int = DEFAULT_MAX_LEVELS,
     ordinal_max_levels: int = DEFAULT_ORDINAL_MAX_LEVELS,
 ) -> TypeResolution:
@@ -403,32 +458,33 @@ def resolve_types(
 
     Overrides are validated against the data; inferred types are accompanied by
     warnings the user should review (integer codes, identifiers, free text).
+    Level names are kept unless the column is listed in ``pseudonymize`` or its
+    override sets ``"pseudonymize": True`` (the override wins over the list).
+    String categoricals that look sensitive only produce a warning.
     """
     columns = _check_columns(df)
     types = dict(types or {})
     unknown = set(types) - set(columns)
     if unknown:
         raise TypeSpecError(f"types refers to unknown columns: {sorted(unknown)}")
-    keep = _normalize_keep_level_names(keep_level_names, columns)
+    listed = _normalize_pseudonymize(pseudonymize, columns)
 
     specs: dict[str, TypeSpec] = {}
     warns: list[TypeWarning] = []
     for name in columns:
         series = df[name]
+        explicit: bool | None = None
         if name in types:
-            spec = _check_override_against_data(name, _parse_override(name, types[name]), series)
+            spec, explicit = _parse_override(name, types[name])
+            spec = _check_override_against_data(name, spec, series)
         else:
             spec, col_warns = infer_column_type(series, max_levels=max_levels,
                                                 ordinal_max_levels=ordinal_max_levels)
             warns.extend(col_warns)
-        if spec.keep_level_names is None and name in keep:
-            spec = TypeSpec(spec.type, spec.levels, True, spec.source, spec.reason)
+        requested = explicit if explicit is not None else name in listed
+        spec, col_warns = _apply_pseudonymize(name, spec, series, requested)
+        warns.extend(col_warns)
         specs[name] = spec
-
-    if keep_level_names == "all":
-        warns.append(TypeWarning("*", "level_names_kept",
-                                 "keep_level_names='all': real level names will be stored in "
-                                 "the profile.", PrivacyWarning))
     return TypeResolution(specs=specs, warnings=warns)
 
 
@@ -436,14 +492,16 @@ def infer_types(
     df: pd.DataFrame,
     types: Mapping[str, Any] | None = None,
     *,
+    pseudonymize: Sequence[str] | None = None,
     max_levels: int = DEFAULT_MAX_LEVELS,
     ordinal_max_levels: int = DEFAULT_ORDINAL_MAX_LEVELS,
 ) -> dict[str, str]:
     """Return ``{column: type}`` as it would be used by ``profile_dataframe``.
 
-    Review the result and pass corrections back via ``types=``.
+    Review the result and the emitted warnings (including pseudonymization hints) and
+    pass corrections back via ``types=`` / ``pseudonymize=``.
     """
-    resolution = resolve_types(df, types, max_levels=max_levels,
+    resolution = resolve_types(df, types, pseudonymize=pseudonymize, max_levels=max_levels,
                                ordinal_max_levels=ordinal_max_levels)
     resolution.emit_warnings()
     return {name: spec.type.value for name, spec in resolution.specs.items()}
