@@ -168,3 +168,7 @@ profile は匿名化を保証するものではありません。level 名、件
 | `test_temporal.py` | date / datetime / time の profile（k ルール、分解能、書式、タイムゾーン）と生成 |
 | `test_marginals.py`、`test_dependence.py`、`test_psd.py`、`test_generate.py` | 周辺分布、相関推定（真値の回復を含む）、PSD 補正、型ごとの生成 |
 | `test_types.py`、`test_schema.py` | 型推定、profile JSON の検証と往復 |
+
+## ライセンス
+
+MIT License です。全文は [LICENSE](LICENSE) を参照してください。Copyright (c) 2026 mizuy
