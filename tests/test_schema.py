@@ -4,17 +4,17 @@ import warnings
 
 import pytest
 
-from clinmock import SCHEMA_VERSION, LevelMap, Profile, ProfileSchemaError, load_profile
-from clinmock.exceptions import ClinmockWarning
-from clinmock.schema import (
+from conftest import build_example_columns, build_example_profile
+from kageframe import SCHEMA_VERSION, LevelMap, Profile, ProfileSchemaError, load_profile
+from kageframe.exceptions import KageFrameWarning
+from kageframe.schema import (
     CategoricalColumn,
     LatentLabel,
     NumericColumn,
     Quantiles,
     latent_labels,
 )
-from clinmock.types import ColumnType as T
-from conftest import build_example_columns, build_example_profile
+from kageframe.types import ColumnType as T
 
 
 def test_roundtrip_dict_json_and_file(example_profile, tmp_path):
@@ -87,7 +87,7 @@ def test_level_map_and_profile_are_not_interchangeable(example_profile, tmp_path
     example_profile.save(prof_path)
     with pytest.raises(ProfileSchemaError, match="level map"):
         load_profile(lm_path)
-    with pytest.raises(ProfileSchemaError, match="not a clinmock level map"):
+    with pytest.raises(ProfileSchemaError, match="not a kageframe level map"):
         LevelMap.load(prof_path)
 
 
@@ -119,7 +119,7 @@ def test_major_version_mismatch_raises(example_profile):
 def test_newer_minor_version_warns(example_profile):
     d = example_profile.to_dict()
     d["schema_version"] = "0.9.0"
-    with pytest.warns(ClinmockWarning, match="newer"):
+    with pytest.warns(KageFrameWarning, match="newer"):
         Profile.from_dict(d)
 
 

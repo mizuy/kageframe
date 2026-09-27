@@ -5,11 +5,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import clinmock
-from clinmock.datasets import EXPECTED_EDGE_CASE_TYPES, EXPECTED_INFERRED_TYPES
-from clinmock.exceptions import PrivacyWarning, TypeInferenceWarning, TypeSpecError
-from clinmock.types import ColumnType as T
-from clinmock.types import infer_column_type, resolve_types
+import kageframe
+from kageframe.datasets import EXPECTED_EDGE_CASE_TYPES, EXPECTED_INFERRED_TYPES
+from kageframe.exceptions import PrivacyWarning, TypeInferenceWarning, TypeSpecError
+from kageframe.types import ColumnType as T
+from kageframe.types import infer_column_type, resolve_types
 
 
 def infer(values, name="x", dtype=None) -> T:
@@ -28,7 +28,7 @@ def infer_warn_codes(values, name="x", dtype=None) -> list[str]:
 def test_fixture_types_are_inferred(clinical_df):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        inferred = clinmock.infer_types(clinical_df)
+        inferred = kageframe.infer_types(clinical_df)
     assert inferred == {**EXPECTED_INFERRED_TYPES, **EXPECTED_EDGE_CASE_TYPES}
 
 
@@ -151,7 +151,7 @@ def df():
 def test_override_string_and_dict_forms(df):
     res = resolve_types(df, {"code": "nominal", "stage": {"type": "ordinal",
                                                         "levels": ["I", "II", "III", "IV"]},
-                             "val": clinmock.ColumnType.NUMERIC})
+                             "val": kageframe.ColumnType.NUMERIC})
     assert res.specs["code"].type is T.NOMINAL
     assert res.specs["code"].source == "override"
     assert res.specs["stage"].levels == ("I", "II", "III", "IV")
@@ -310,11 +310,11 @@ def test_fixture_warnings(clinical_df):
 
 def test_infer_types_emits_python_warnings(df):
     with pytest.warns(TypeInferenceWarning, match="code"):
-        out = clinmock.infer_types(df)
+        out = kageframe.infer_types(df)
     assert out == {"stage": "nominal", "code": "ordinal", "sex": "binary", "val": "numeric"}
 
 
 def test_privacy_warning_category():
     frame = pd.DataFrame({"pid": [f"P{i:06d}" for i in range(300)]})
     with pytest.warns(PrivacyWarning):
-        clinmock.infer_types(frame)
+        kageframe.infer_types(frame)

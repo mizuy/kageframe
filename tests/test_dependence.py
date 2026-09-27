@@ -7,18 +7,18 @@ import pandas as pd
 import pytest
 from scipy import stats
 
-from clinmock import profile_dataframe
-from clinmock.datasets import latent_correlation
-from clinmock.dependence import observed_to_latent, pairwise_latent_correlation
-from clinmock.exceptions import ClinmockWarning
-from clinmock.latent import (
+from kageframe import profile_dataframe
+from kageframe.datasets import latent_correlation
+from kageframe.dependence import observed_to_latent, pairwise_latent_correlation
+from kageframe.exceptions import KageFrameWarning
+from kageframe.latent import (
     hermite_coefficients,
     interval_scores,
     invert_mehler,
     nominal_b_matrix,
     nominal_choice,
 )
-from clinmock.schema import LatentLabel
+from kageframe.schema import LatentLabel
 
 
 def _label_name(label: LatentLabel) -> str:
@@ -107,7 +107,7 @@ def test_sparse_pairs_set_to_zero_and_warn() -> None:
     a = np.where(np.arange(n) < 200, z, np.nan)
     b = np.where(np.arange(n) >= 190, z + 0.01 * rng.normal(size=n), np.nan)
     df = pd.DataFrame({"a": a, "b": b})
-    with pytest.warns(ClinmockWarning, match="jointly observed"):
+    with pytest.warns(KageFrameWarning, match="jointly observed"):
         p = profile_dataframe(df)
     assert p.dependence.latent.matrix[0][1] == 0.0
     assert any(w.code == "sparse_pairs" for w in p.warnings)

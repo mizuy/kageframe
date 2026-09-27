@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from clinmock.psd import EIG_FLOOR, nearest_correlation
+from kageframe.psd import EIG_FLOOR, nearest_correlation
 
 
 def _indefinite() -> np.ndarray:

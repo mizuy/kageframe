@@ -16,11 +16,11 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ._version import __version__
-from .exceptions import ClinmockWarning, ProfileSchemaError
+from .exceptions import KageFrameWarning, ProfileSchemaError
 from .types import CATEGORICAL_TYPES, LATENT_TYPES, ColumnType
 
 SCHEMA_VERSION = "0.1.0"
-LEVEL_MAP_KIND = "clinmock_level_map"
+LEVEL_MAP_KIND = "kageframe_level_map"
 LEVEL_MAP_WARNING = "LOCAL ONLY - DO NOT SHARE. Maps pseudonymized level names to real values."
 DATE_REFERENCE = "1970-01-01"
 
@@ -764,7 +764,7 @@ class LevelMap:
     def from_dict(cls, d: Any) -> LevelMap:
         d = _require_mapping(d, "level_map")
         if d.get("kind") != LEVEL_MAP_KIND:
-            raise ProfileSchemaError("not a clinmock level map (missing kind="
+            raise ProfileSchemaError("not a kageframe level map (missing kind="
                                      f"{LEVEL_MAP_KIND!r})")
         _check_keys(d, "level_map", {"kind", "schema_version", "warning", "columns"}, set())
         _check_version(d["schema_version"], "level_map.schema_version")
@@ -804,7 +804,7 @@ def _check_version(v: Any, path: str) -> None:
         raise _err(path, f"schema version {v} is incompatible with {SCHEMA_VERSION}")
     if minor > cur_minor:
         warnings.warn(f"profile schema {v} is newer than supported {SCHEMA_VERSION}",
-                      ClinmockWarning, stacklevel=4)
+                      KageFrameWarning, stacklevel=4)
 
 
 def _check_options(d: Any) -> dict[str, Any]:
@@ -826,7 +826,7 @@ def _check_options(d: Any) -> dict[str, Any]:
 
 
 def _reject_constant(token: str) -> Any:
-    raise ProfileSchemaError(f"non-finite number {token} is not allowed in clinmock JSON")
+    raise ProfileSchemaError(f"non-finite number {token} is not allowed in kageframe JSON")
 
 
 def _dumps(obj: Any) -> str:
@@ -851,7 +851,7 @@ class Profile:
     dependence: Dependence | None = None
     warnings: list[WarningRecord] = field(default_factory=list)
     schema_version: str = SCHEMA_VERSION
-    clinmock_version: str = __version__
+    kageframe_version: str = __version__
     level_map: LevelMap | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -911,7 +911,7 @@ class Profile:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
-            "clinmock_version": self.clinmock_version,
+            "kageframe_version": self.kageframe_version,
             "n_rows": self.n_rows,
             "options": dict(self.options),
             "columns": [c.to_dict() for c in self.columns],
@@ -925,7 +925,7 @@ class Profile:
         if d.get("kind") == LEVEL_MAP_KIND:
             raise ProfileSchemaError("this file is a level map, not a profile; "
                                      "load it with LevelMap.load")
-        _check_keys(d, "profile", {"schema_version", "clinmock_version", "n_rows", "options",
+        _check_keys(d, "profile", {"schema_version", "kageframe_version", "n_rows", "options",
                                    "columns", "dependence", "warnings"}, set())
         _check_version(d["schema_version"], "schema_version")
         if not isinstance(d["columns"], list):
@@ -945,7 +945,7 @@ class Profile:
             warnings=[WarningRecord.from_dict(w, f"warnings[{i}]")
                       for i, w in enumerate(d["warnings"])],
             schema_version=d["schema_version"],
-            clinmock_version=_string(d["clinmock_version"], "clinmock_version"),
+            kageframe_version=_string(d["kageframe_version"], "kageframe_version"),
         )
 
     def to_json(self) -> str:

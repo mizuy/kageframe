@@ -118,7 +118,7 @@ def make_clinical_like_df(
     missing: bool = True,
     edge_cases: bool = False,
 ) -> pd.DataFrame:
-    """Generate a DataFrame containing every column type supported by clinmock.
+    """Generate a DataFrame containing every column type supported by kageframe.
 
     Columns: ``patient_id`` (id), ``age``/``bmi``/``crp`` (numeric; integer ties,
     one decimal, point mass at zero), ``sex`` (binary strings), ``smoker`` (binary

@@ -5,9 +5,9 @@ import warnings
 import pandas as pd
 import pytest
 
-from clinmock import profile_dataframe
-from clinmock.datasets import RECOMMENDED_TYPES, make_clinical_like_df
-from clinmock.schema import (
+from kageframe import profile_dataframe
+from kageframe.datasets import RECOMMENDED_TYPES, make_clinical_like_df
+from kageframe.schema import (
     CategoricalColumn,
     ConstantColumn,
     CorrelationMatrix,
@@ -25,7 +25,7 @@ from clinmock.schema import (
     WarningRecord,
     latent_labels,
 )
-from clinmock.types import ColumnType as T
+from kageframe.types import ColumnType as T
 
 
 @pytest.fixture(scope="session")

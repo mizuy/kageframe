@@ -3,9 +3,9 @@ requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
 [project]
-name = "clinmock"
+name = "kageframe"
 dynamic = ["version"]
-description = "Profile clinical data locally and generate statistically similar dummy datasets for code development."
+description = "KageFrame - a statistical shadow of your DataFrame. Profile clinical data locally and generate statistically similar dummy datasets for code development."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,10 +22,10 @@ dev = [
 ]
 
 [tool.hatch.version]
-path = "src/clinmock/_version.py"
+path = "src/kageframe/_version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/clinmock"]
+packages = ["src/kageframe"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

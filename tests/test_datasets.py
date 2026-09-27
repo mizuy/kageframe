@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from clinmock.datasets import (
+from kageframe.datasets import (
     EXPECTED_EDGE_CASE_TYPES,
     EXPECTED_INFERRED_TYPES,
     INDICATION_LEVELS,

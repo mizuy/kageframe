@@ -11,7 +11,7 @@ import pandas as pd
 from scipy import special
 
 from .dependence import nominal_fixed_mask
-from .exceptions import ClinmockWarning
+from .exceptions import KageFrameWarning
 from .latent import nominal_choice, thresholds
 from .psd import EIG_FLOOR, nearest_correlation
 from .schema import (
@@ -39,7 +39,7 @@ def _latent_factor(profile: Profile) -> np.ndarray:
         return np.linalg.cholesky(r)
     except np.linalg.LinAlgError:
         warnings.warn("latent correlation matrix is not positive definite; applying the "
-                      "nearest-PSD correction before sampling", ClinmockWarning, stacklevel=3)
+                      "nearest-PSD correction before sampling", KageFrameWarning, stacklevel=3)
         fixed, _ = nearest_correlation(r, nominal_fixed_mask(labels), eps=EIG_FLOOR)
         return np.linalg.cholesky(fixed)
 

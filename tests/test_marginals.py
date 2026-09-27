@@ -7,11 +7,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from clinmock import generate, profile_dataframe
-from clinmock.datasets import RARE_INDICATIONS, RECOMMENDED_TYPES
-from clinmock.exceptions import ClinmockWarning, PrivacyWarning
-from clinmock.marginals.numeric import detect_decimals
-from clinmock.schema import (
+from kageframe import generate, profile_dataframe
+from kageframe.datasets import RARE_INDICATIONS, RECOMMENDED_TYPES
+from kageframe.exceptions import KageFrameWarning, PrivacyWarning
+from kageframe.marginals.numeric import detect_decimals
+from kageframe.schema import (
     ConstantColumn,
     IdColumn,
     LevelMap,
@@ -19,7 +19,7 @@ from clinmock.schema import (
     Profile,
     ReasonColumn,
 )
-from clinmock.types import ColumnType as T
+from kageframe.types import ColumnType as T
 
 
 def quiet_profile(df: pd.DataFrame, **kwargs) -> Profile:
@@ -102,7 +102,7 @@ def test_numeric_too_few_values() -> None:
     x = np.full(100, np.nan)
     x[:15] = np.arange(15) + 0.5
     df = pd.DataFrame({"x": x, "y": np.arange(100) + 0.25})
-    with pytest.warns(ClinmockWarning, match="fewer than 20"):
+    with pytest.warns(KageFrameWarning, match="fewer than 20"):
         p = profile_dataframe(df)
     col = p.column("x")
     assert col.grid is None and col.min is None and "too_few_values" in warning_codes(p, "x")

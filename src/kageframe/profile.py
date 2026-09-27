@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .dependence import nominal_fixed_mask, observed_to_latent, pairwise_latent_correlation
-from .exceptions import ClinmockWarning, PrivacyWarning
+from .exceptions import KageFrameWarning, PrivacyWarning
 from .marginals import ColumnResult
 from .marginals.categorical import profile_categorical
 from .marginals.numeric import profile_numeric
@@ -191,7 +191,7 @@ def profile_dataframe(
     for name in df.columns:
         result = _profile_column(name, df[name], resolution.specs[name], n_rows, options)
         for w in result.warnings:
-            category = PrivacyWarning if w.code in _PRIVACY_CODES else ClinmockWarning
+            category = PrivacyWarning if w.code in _PRIVACY_CODES else KageFrameWarning
             warnings.warn(f"[{w.column}] {w.message}", category, stacklevel=2)
         records.extend(result.warnings)
         if result.level_map:
@@ -201,7 +201,7 @@ def profile_dataframe(
     dependence_warnings: list[WarningRecord] = []
     dependence = _estimate_dependence(results, n_rows, options, dependence_warnings)
     for w in dependence_warnings:
-        warnings.warn(w.message, ClinmockWarning, stacklevel=2)
+        warnings.warn(w.message, KageFrameWarning, stacklevel=2)
     records.extend(dependence_warnings)
 
     return Profile(n_rows=n_rows, columns=[r.column for r in results], options=options,

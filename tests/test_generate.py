@@ -6,11 +6,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from clinmock import generate, profile_dataframe
-from clinmock.datasets import RECOMMENDED_TYPES, make_clinical_like_df
-from clinmock.exceptions import ClinmockWarning
-from clinmock.schema import CategoricalColumn, Profile, load_profile
-from clinmock.types import ColumnType as T
+from kageframe import generate, profile_dataframe
+from kageframe.datasets import RECOMMENDED_TYPES, make_clinical_like_df
+from kageframe.exceptions import KageFrameWarning
+from kageframe.schema import CategoricalColumn, Profile, load_profile
+from kageframe.types import ColumnType as T
 
 CATEGORICAL = ("sex", "smoker", "stage", "ecog", "indication", "lab_flag")
 
@@ -186,7 +186,7 @@ def test_non_positive_definite_matrix_falls_back(clinical_profile) -> None:
     for a, b, v in ((i, j, 0.95), (i, k, 0.95), (j, k, -0.95)):
         m[a][b] = m[b][a] = v
     broken = Profile.from_dict(d)
-    with pytest.warns(ClinmockWarning, match="not positive definite"):
+    with pytest.warns(KageFrameWarning, match="not positive definite"):
         out = generate(broken, n=500, seed=0)
     assert len(out) == 500 and out["age"].notna().all()
 
