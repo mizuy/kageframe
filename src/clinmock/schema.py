@@ -31,8 +31,9 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "discrete_max_levels": 20,
     "max_levels": 50,
     "ordinal_max_levels": 10,
+    "min_pair_count": 30,
     "datetime_mode": "split",
-    "correlation_estimator": "normal_scores_corrected",
+    "correlation_estimator": "interval_scores_mehler",
 }
 
 Scalar = str | int | float | bool
@@ -264,7 +265,7 @@ class NumericColumn(ColumnProfile):
     """``min``/``max`` hold the k/n and 1-k/n quantiles, never the true extremes."""
 
     subtype: str = "float"
-    decimals: int = 0
+    decimals: int | None = 0  # None: more than 6 decimals, values are not rounded
     min: float | None = None
     max: float | None = None
     mean: float | None = None
@@ -298,7 +299,7 @@ class NumericColumn(ColumnProfile):
         mode = _string(d["mode"], f"{path}.mode", choices=("quantile", "discrete"))
         out: dict[str, Any] = {
             "subtype": _string(d["subtype"], f"{path}.subtype", choices=("integer", "float")),
-            "decimals": _integer(d["decimals"], f"{path}.decimals"),
+            "decimals": _integer(d["decimals"], f"{path}.decimals", nullable=True),
             "min": _number(d["min"], f"{path}.min", nullable=True),
             "max": _number(d["max"], f"{path}.max", nullable=True),
             "mean": _number(d["mean"], f"{path}.mean", nullable=True),
@@ -686,7 +687,7 @@ class Dependence:
         _check_keys(d, path, {"method", "observed", "latent", "psd_correction"}, set())
         _string(d["method"], f"{path}.method", choices=("latent_gaussian_copula",))
         dim = len(expected)
-        blocks = _nominal_blocks(expected)
+        blocks = nominal_blocks(expected)
         parsed = {}
         for part in ("observed", "latent"):
             p = f"{path}.{part}"
@@ -713,7 +714,7 @@ class Dependence:
         return cls(parsed["observed"], parsed["latent"], d["method"], dict(psd))
 
 
-def _nominal_blocks(labels: list[LatentLabel]) -> list[int]:
+def nominal_blocks(labels: list[LatentLabel]) -> list[int]:
     """Block id per dimension; dimensions of the same nominal column share an id."""
     ids: list[int] = []
     for i, lb in enumerate(labels):
@@ -894,9 +895,13 @@ class Profile:
         if self.level_map is not None:
             for c, mapping in self.level_map.columns.items():
                 col = self.column(c) if c in names else None
-                if not isinstance(col, CategoricalColumn) or not col.pseudonymized:
+                if isinstance(col, CategoricalColumn) and col.pseudonymized:
+                    known = set(map(str, col.levels))
+                elif isinstance(col, ConstantColumn):
+                    known = {str(col.value)}
+                else:
                     raise _err("level_map", f"column {c!r} is not a pseudonymized categorical")
-                unknown = set(mapping) - set(map(str, col.levels))
+                unknown = set(mapping) - known
                 if unknown:
                     raise _err(f"level_map.columns.{c}",
                                f"pseudonyms not among the column's levels: {sorted(unknown)}")

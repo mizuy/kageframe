@@ -1,7 +1,7 @@
 """clinmock: profile clinical data locally, generate dummy data for code development.
 
-V0.1 status: type schema and profile JSON (M1). ``profile_dataframe``, ``generate``
-and ``compare`` are added in later milestones.
+V0.1 status: ``profile_dataframe`` and ``generate`` (M2-M4). Missingness, date/time
+columns and ``compare`` are added in later milestones.
 """
 
 from ._version import __version__
@@ -13,6 +13,8 @@ from .exceptions import (
     TypeInferenceWarning,
     TypeSpecError,
 )
+from .generate import generate
+from .profile import profile_dataframe
 from .schema import SCHEMA_VERSION, LevelMap, Profile, load_profile
 from .types import ColumnType, TypeSpec, infer_types, resolve_types
 
@@ -29,7 +31,9 @@ __all__ = [
     "TypeSpec",
     "TypeSpecError",
     "__version__",
+    "generate",
     "infer_types",
     "load_profile",
+    "profile_dataframe",
     "resolve_types",
 ]

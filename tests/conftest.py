@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import warnings
+
 import pandas as pd
 import pytest
 
-from clinmock.datasets import make_clinical_like_df
+from clinmock import profile_dataframe
+from clinmock.datasets import RECOMMENDED_TYPES, make_clinical_like_df
 from clinmock.schema import (
     CategoricalColumn,
     ConstantColumn,
@@ -28,6 +31,13 @@ from clinmock.types import ColumnType as T
 @pytest.fixture(scope="session")
 def clinical_df() -> pd.DataFrame:
     return make_clinical_like_df(n=10000, seed=0, edge_cases=True)
+
+
+@pytest.fixture(scope="session")
+def clinical_profile(clinical_df: pd.DataFrame) -> Profile:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return profile_dataframe(clinical_df, types=RECOMMENDED_TYPES)
 
 
 def _grid(values: list[float]) -> Quantiles:
