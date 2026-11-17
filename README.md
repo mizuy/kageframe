@@ -2,13 +2,13 @@
 
 *a statistical shadow of your DataFrame*
 
-`kageframe` は、手元の DataFrame（主に臨床データ）を**要約統計だけの profile** に変換し、その profile から、列・型・周辺分布・欠測率・おおまかな変数間の依存が近い **dummy DataFrame** を生成するライブラリです。実データはローカルに残したまま、dummy data だけを使って解析コードを書く・レビューする・coding agent に渡す、という運用を想定しています。
+`kageframe` は、手元の Polars DataFrame（主に臨床データ）を**要約統計だけの profile** に変換し、その profile から、列・型・周辺分布・欠測率・おおまかな変数間の依存が近い **dummy DataFrame** を生成するライブラリです。実データはローカルに残したまま、dummy data だけを使って解析コードを書く・レビューする・coding agent に渡す、という運用を想定しています。
 
-**状態: V0.1 開発中。** `profile_dataframe` / `generate` / `compare` が使えます。numeric・binary・ordinal・nominal・date・datetime・time の全型と欠測（MCAR）に対応しています。V0.1 のリリースまでは API と profile JSON のスキーマ（`0.1.0`）が変わる可能性があります。
+**状態: V0.2 開発中。** V0.2 で pandas から Polars に全面的に移りました（pandas には依存しません）。 `profile_dataframe` / `generate` / `compare` が使えます。numeric・binary・ordinal・nominal・date・datetime・time の全型と欠測（MCAR）に対応しています。リリースまでは API と profile JSON のスキーマ（`0.2.0`）が変わる可能性があります。`0.1.0`（pandas 版）の profile は読み込めないので、作り直してください。
 
 ## インストール
 
-Python 3.10 以上が必要です。依存は numpy・pandas（2.x 以降）・scipy だけです。PyPI にはまだ公開していないので、GitHub から入れてください。
+Python 3.10 以上が必要です。依存は numpy・polars（2.x 以降）・scipy だけです。PyPI にはまだ公開していないので、GitHub から入れてください。
 
 ```bash
 pip install "git+https://github.com/mizuy/kageframe.git"
@@ -28,7 +28,7 @@ python3 -m venv .venv
 
 ```python
 import kageframe
-from kageframe.datasets import make_clinical_like_df
+from kageframe.datasets import make_clinical_like_df  # pl.DataFrame を返す
 
 # 実データの代わりに、乱数だけで作った臨床風データを使う
 df = make_clinical_like_df(n=10000, seed=0)
@@ -59,8 +59,11 @@ report.correlation_table()                   # 変数ペアごとの latent 相�
 | `seed` | 乱数の seed。同じ profile・`n`・`seed` なら同じ DataFrame になる（同じ numpy のバージョンの場合） |
 | `missing` | 欠測の付け方。`"exact"`（既定、各列ちょうど `round(n × 欠測率)` 行）、`"bernoulli"`（行ごとに独立）、`"none"`（欠測なし） |
 | `level_map` | 仮名化した level を実名に戻す対応表（後述） |
+| `id_values` | ID 列に使う値（`{列名: 値の列}`、各 `n` 個）。指定しなければ連番を作る。別の表と ID をそろえたいときに使う。この列には欠測を付けない |
 
-出力の列順は元の DataFrame と同じです。free text 列と除外した列は出力しません。ID 列は `ID000001` 形式（整数 ID なら 1, 2, …）の新しい値になります。整数列や bool 列に欠測があれば `Int64` / `boolean` になり、Categorical の列は Categorical に戻ります。
+入出力はどちらも `polars.DataFrame` です（`LazyFrame` を渡すと collect します）。pandas の DataFrame は `pl.from_pandas(df)` で変換してから渡してください。出力の列順は元の DataFrame と同じです。free text 列と除外した列は出力しません。ID 列は `ID000001` 形式（整数 ID なら 1, 2, …）の新しい値になります。
+
+dtype は元の列に合わせます。`Int32` や `Float32` などの幅、`Date` / `Datetime`（time unit とタイムゾーン）/ `Time` / `Duration`、`Categorical`、`Enum` を元に戻します。日付・時刻の文字列の列は、元と同じ書式の文字列になります。欠測は常に null です（float の NaN は使いません）。入力の float 列の NaN は null と同じく欠測として数えます。
 
 `compare(profile, dummy).check()` は次の既定の許容誤差で判定します（`kageframe.DEFAULT_TOLERANCES`、`check(tol={...})` で変更できます）。
 
@@ -80,13 +83,13 @@ report.correlation_table()                   # 変数ペアごとの latent 相�
 |---|---|---|
 | `numeric` | 年齢、BMI、検査値 | 数値列（下の条件に当たらないもの） |
 | `binary` | 性別、0/1 フラグ、bool | 値が 2 種類の文字列、{0, 1}、bool |
-| `ordinal` | ECOG、病期 | 値が 10 種類以下の整数、順序付き Categorical |
-| `nominal` | 紹介理由、施設 | 値が 50 種類以下の文字列 |
-| `date` / `datetime` / `time` | 検査日、入院日時、来院時刻 | datetime64、日付・時刻の文字列、`datetime.time`、timedelta |
+| `ordinal` | ECOG、病期 | 値が 10 種類以下の整数、`pl.Enum` |
+| `nominal` | 紹介理由、施設 | 値が 50 種類以下の文字列、`pl.Categorical` |
+| `date` / `datetime` / `time` | 検査日、入院日時、来院時刻 | `Date`、`Datetime`（時刻がすべて 0:00 なら date）、`Time`、`Duration`、日付・時刻の文字列 |
 | `id` | 患者 ID | ほぼ全行で異なる短い文字列、連番の整数 |
 | `text` | 自由記載 | 長い文字列、種類が多すぎる文字列 |
 
-推定が意図と違う場合や、整数コードの列（1/2/3 など）は `types=` で明示してください。
+`List` / `Struct` などの入れ子の列は扱えないので、警告を出して除外します。推定が意図と違う場合や、整数コードの列（1/2/3 など）は `types=` で明示してください。
 
 ```python
 types = {
@@ -151,6 +154,8 @@ profile は匿名化を保証するものではありません。level 名、件
 
 - 依存構造は Gaussian copula で表します。各列を正規スコアに変換し、latent 相関を推定します。binary/ordinal の組み合わせは Mehler 展開を逆算して補正します。nominal は Gumbel-max で生成するので、level の頻度は正確に再現されます。
 - datetime は日付部分と時刻部分に分けて扱います。曜日×時刻のような非単調な依存は再現しません。
+- タイムゾーン付きの `Datetime` は、その地域の壁時計の時刻で profile します。生成時に存在しない時刻（夏時間の切り替え）は null になります。UTC オフセット付きの文字列（`+09:00`、`Z`）は UTC に直して扱い、タイムゾーンは `UTC` になります。
+- 日付の文字列は `YYYY-MM-DD`（区切りは `-` `/` `.`）、時刻は `H:MM[:SS]` の形だけを認識します。
 - 欠測は MCAR（完全にランダム）で付けます。欠測どうしの相関や、値に依存する欠測は再現しません。
 - 日付の前後関係などの論理制約（退院日 ≥ 入院日など）は保証しません。
 - 裾の極端な値は、privacy のために `k/n` 分位までしか再現しません。
@@ -164,7 +169,7 @@ profile は匿名化を保証するものではありません。level 名、件
 |---|---|
 | `test_mvp_acceptance.py` | MVP の完成条件 7 項目（列、周辺分布、カテゴリ頻度、欠測率、依存、nominal が 1 つだけ、seed の再現性）を、臨床風 fixture で end-to-end に確認する |
 | `test_compare.py` | 自分自身から生成した dummy が通ること。列の欠落・分布のずれ・未知の level・欠測率の変化・依存の破壊を注入すると検出されること |
-| `test_missing.py` | 欠測率の再現（exact / bernoulli / none）、MCAR であること、nullable dtype |
+| `test_missing.py` | 欠測率の再現（exact / bernoulli / none）、MCAR であること、欠測が null になること |
 | `test_temporal.py` | date / datetime / time の profile（k ルール、分解能、書式、タイムゾーン）と生成 |
 | `test_marginals.py`、`test_dependence.py`、`test_psd.py`、`test_generate.py` | 周辺分布、相関推定（真値の回復を含む）、PSD 補正、型ごとの生成 |
 | `test_types.py`、`test_schema.py` | 型推定、profile JSON の検証と往復 |

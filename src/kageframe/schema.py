@@ -19,7 +19,7 @@ from ._version import __version__
 from .exceptions import KageFrameWarning, ProfileSchemaError
 from .types import CATEGORICAL_TYPES, LATENT_TYPES, ColumnType
 
-SCHEMA_VERSION = "0.1.0"
+SCHEMA_VERSION = "0.2.0"
 LEVEL_MAP_KIND = "kageframe_level_map"
 LEVEL_MAP_WARNING = "LOCAL ONLY - DO NOT SHARE. Maps pseudonymized level names to real values."
 DATE_REFERENCE = "1970-01-01"

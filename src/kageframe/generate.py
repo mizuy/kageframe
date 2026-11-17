@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import datetime as _dt
-import re
 import warnings
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from scipy import special
 
+from ._frame import parse_dtype
 from .dependence import nominal_fixed_mask
 from .exceptions import KageFrameWarning
 from .latent import nominal_choice, thresholds
@@ -42,8 +43,6 @@ _LATENT_STREAM = 0
 _MISSING_STREAM = 1
 _N_STREAMS = 2
 MISSING_MODES = ("exact", "bernoulli", "none")
-_DATETIME_UNIT_RE = re.compile(r"^datetime64\[(s|ms|us|ns)")
-_NULLABLE_INT_RE = re.compile(r"^U?Int(8|16|32|64)$")
 
 
 def _latent_factor(profile: Profile) -> np.ndarray:
@@ -140,24 +139,29 @@ def _time_seconds(col: TimeColumn, z: np.ndarray) -> np.ndarray | None:
     return None if secs is None else clip_seconds(secs, res)
 
 
-def _constant(col: ConstantColumn, n: int, level_map: LevelMap | None) -> Any:
+def _constant(col: ConstantColumn, n: int, level_map: LevelMap | None) -> pl.Series:
     value = col.value
     if level_map is not None and col.name in level_map.columns:
         value = level_map.columns[col.name].get(str(value), value)
     kind = col.value_kind
-    if kind in ("date", "datetime"):
-        return np.full(n, np.datetime64(pd.Timestamp(value).to_datetime64()))
+    if kind == "date":
+        return pl.Series([_dt.date.fromisoformat(str(value))] * n, dtype=pl.Date)
+    if kind == "datetime":
+        v = _dt.datetime.fromisoformat(str(value))
+        if v.tzinfo is not None:
+            v = v.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        return pl.Series([v] * n, dtype=pl.Datetime("us"))
     if kind == "time":
-        return np.full(n, _dt.time.fromisoformat(str(value)), dtype=object)
-    dtype = {"bool": bool, "int": np.int64, "float": float}.get(kind, object)
-    return np.full(n, value, dtype=dtype)
+        return pl.Series([_dt.time.fromisoformat(str(value))] * n, dtype=pl.Time)
+    dtype = {"bool": pl.Boolean, "int": pl.Int64, "float": pl.Float64}.get(kind, pl.String)
+    return pl.Series([value] * n, dtype=dtype)
 
 
-def _ids(col: IdColumn, n: int) -> np.ndarray:
+def _ids(col: IdColumn, n: int) -> pl.Series:
     if col.value_kind == "int":
-        return np.arange(1, n + 1, dtype=np.int64)
+        return pl.Series(np.arange(1, n + 1, dtype=np.int64))
     width = max(col.width, len(str(n)))
-    return np.array([f"{col.prefix}{i:0{width}d}" for i in range(1, n + 1)], dtype=object)
+    return pl.Series([f"{col.prefix}{i:0{width}d}" for i in range(1, n + 1)], dtype=pl.String)
 
 
 # ---------------------------------------------------------------------------
@@ -178,54 +182,44 @@ def missing_mask(n: int, rate: float, mode: str, rng: np.random.Generator) -> np
     return mask
 
 
-def _nullable_integer(source_dtype: str) -> bool:
-    return _NULLABLE_INT_RE.match(source_dtype) is not None
+def _castable(have: pl.DataType, want: pl.DataType) -> bool:
+    if have.is_numeric() and want.is_numeric():
+        return True
+    temporal = (pl.Date, pl.Datetime)
+    return have.base_type() in temporal and want.base_type() in temporal
+
+
+def _restore_dtype(col: ColumnProfile, s: pl.Series, levels: list | None) -> pl.Series:
+    """Cast to a dtype close to the source column (``col.source_dtype``)."""
+    src = col.source_dtype
+    if levels is not None and s.dtype == pl.String:
+        if src == "Enum":
+            return s.cast(pl.Enum([str(v) for v in levels]))
+        return s.cast(pl.Categorical())
+    want = parse_dtype(src)
+    if want is not None and s.dtype != want and _castable(s.dtype, want):
+        s = s.cast(want)
+    tz = getattr(col, "tz", None)
+    if tz and s.dtype.base_type() is pl.Datetime:
+        s = s.dt.replace_time_zone(tz, ambiguous="latest", non_existent="null")
+    return s
 
 
 def _finalize(col: ColumnProfile, values: Any, mask: np.ndarray,
-              categories: list | None = None) -> pd.Series:
+              levels: list | None = None) -> pl.Series:
     """Apply the missing mask and restore a dtype close to the source column."""
-    src = col.source_dtype
-    arr = np.asarray(values)
-    has_missing = bool(mask.any())
-
-    if arr.dtype.kind == "M":
-        s = pd.Series(arr)
-        m = _DATETIME_UNIT_RE.match(src)
-        if m:
-            s = s.astype(f"datetime64[{m.group(1)}]")
-        tz = getattr(col, "tz", None)
-        if tz:
-            s = s.dt.tz_localize(tz, ambiguous=np.zeros(len(s), dtype=bool),
-                                 nonexistent="shift_forward")
-        return s.mask(mask) if has_missing else s
-    if arr.dtype.kind == "m":
-        s = pd.Series(arr)
-        return s.mask(mask) if has_missing else s
-    if arr.dtype.kind in "iu":
-        if has_missing or _nullable_integer(src):
-            out = pd.array(arr, dtype="Int64")
-            out[mask] = pd.NA
-            return pd.Series(out)
-        return pd.Series(arr)
-    if arr.dtype.kind == "b":
-        if has_missing or src == "boolean":
-            out = pd.array(arr, dtype="boolean")
-            out[mask] = pd.NA
-            return pd.Series(out)
-        return pd.Series(arr)
-    if arr.dtype.kind == "f":
-        out = arr.astype(float)
-        out[mask] = np.nan
-        return pd.Series(out)
-    out = arr.astype(object)
-    out[mask] = None
-    s = pd.Series(out, dtype=object)
-    if categories is not None:
-        return s.astype(pd.CategoricalDtype(categories, ordered=col.type is ColumnType.ORDINAL))
-    if src in ("str", "string"):
-        return s.astype(src)
-    return s
+    if isinstance(values, np.ndarray) and values.dtype.kind == "M" \
+            and values.dtype != np.dtype("datetime64[D]"):
+        values = values.astype("datetime64[us]")
+    s = values if isinstance(values, pl.Series) else pl.Series(values)
+    if s.dtype == pl.Object:
+        s = pl.Series([None if v is None else str(v) for v in s.to_list()], dtype=pl.String)
+    if s.dtype.is_float():
+        s = s.fill_nan(None)
+    s = _restore_dtype(col, s, levels)
+    if mask.any():
+        s = s.scatter(np.flatnonzero(mask), None)
+    return s.alias(col.name)
 
 
 def _resolve_level_map(level_map: LevelMap | dict | str | Path | None) -> LevelMap | None:
@@ -243,7 +237,8 @@ def generate(
     *,
     missing: str = "exact",
     level_map: LevelMap | dict | str | Path | None = None,
-) -> pd.DataFrame:
+    id_values: Mapping[str, Sequence[Any] | pl.Series] | None = None,
+) -> pl.DataFrame:
     """Generate a dummy DataFrame from ``profile``.
 
     Parameters
@@ -262,12 +257,17 @@ def generate(
     level_map:
         A local :class:`LevelMap` (or its dict / file path) to turn pseudonymized levels
         back into the real names. Without it, pseudonyms such as ``L01`` are kept.
+    id_values:
+        Values to use for identifier columns instead of new sequential ids, as
+        ``{column: values}`` with ``n`` values each (e.g. keys shared with another table).
+        No missing values are added to these columns.
 
     Returns
     -------
-    pandas.DataFrame
+    polars.DataFrame
         One column per profiled column, in the original order, except free-text and
-        excluded columns. Identifier columns get new sequential values.
+        excluded columns. Identifier columns get new sequential values unless given in
+        ``id_values``.
     """
     n = profile.n_rows if n is None else int(n)
     if n < 1:
@@ -275,6 +275,7 @@ def generate(
     if missing not in MISSING_MODES:
         raise ValueError(f"missing must be one of {MISSING_MODES}")
     lm = _resolve_level_map(level_map)
+    ids = _check_id_values(profile, id_values, n)
     streams = np.random.SeedSequence(seed).spawn(_N_STREAMS)
     rng = np.random.default_rng(streams[_LATENT_STREAM])
     missing_streams = streams[_MISSING_STREAM].spawn(len(profile.columns))
@@ -284,7 +285,7 @@ def generate(
     z = rng.standard_normal((n, d)) @ factor.T if d else np.zeros((n, 0))
 
     offset = 0
-    data: dict[str, pd.Series] = {}
+    data: list[pl.Series] = []
     for i, col in enumerate(profile.columns):
         width = _latent_width(col)
         block = z[:, offset:offset + width]
@@ -297,7 +298,7 @@ def generate(
             values = _numeric(col, block[:, 0])
         elif isinstance(col, CategoricalColumn):
             values = _categorical(col, block, lm)
-            if col.source_dtype == "category":
+            if col.source_dtype in ("Categorical", "Enum"):
                 categories = _mapped_levels(col, lm)
         elif isinstance(col, DateColumn):
             values = _date(col, block)
@@ -309,24 +310,46 @@ def generate(
                 values = _as_strings(values, col.output_format)
         elif isinstance(col, TimeColumn):
             secs = _time_seconds(col, block)
-            values = (np.full(n, None, dtype=object) if secs is None
+            values = (pl.Series([None] * n, dtype=pl.String) if secs is None
                       else format_times(secs, col.output_format, col.source_dtype))
         elif isinstance(col, IdColumn):
+            if col.name in ids:
+                data.append(ids[col.name])
+                continue
             values = _ids(col, n)
         elif isinstance(col, ConstantColumn):
             values = _constant(col, n, lm)
         elif col.type is ColumnType.EMPTY:
-            data[col.name] = pd.Series(np.full(n, np.nan))
+            data.append(pl.Series(col.name, [None] * n,
+                                  dtype=parse_dtype(col.source_dtype) or pl.Null))
             continue
         else:
             raise NotImplementedError(f"generation of {col.type.value} columns is not "
                                       "supported")
         mask = missing_mask(n, col.missing_rate, missing,
                             np.random.default_rng(missing_streams[i]))
-        data[col.name] = _finalize(col, values, mask, categories)
-    return pd.DataFrame(data, index=pd.RangeIndex(n))
+        data.append(_finalize(col, values, mask, categories))
+    return pl.DataFrame(data)
 
 
-def _as_strings(values: np.ndarray, fmt: str) -> np.ndarray:
-    s = pd.Series(values)
-    return s.dt.strftime(fmt).to_numpy(dtype=object, na_value=None)
+def _as_strings(values: np.ndarray, fmt: str) -> pl.Series:
+    if values.dtype != np.dtype("datetime64[D]"):
+        values = values.astype("datetime64[us]")
+    return pl.Series(values).dt.to_string(fmt)
+
+
+def _check_id_values(profile: Profile, id_values: Mapping[str, Any] | None,
+                     n: int) -> dict[str, pl.Series]:
+    if not id_values:
+        return {}
+    id_columns = {c.name for c in profile.columns if isinstance(c, IdColumn)}
+    unknown = sorted(set(id_values) - id_columns)
+    if unknown:
+        raise ValueError(f"id_values refers to columns that are not id columns: {unknown}")
+    out = {}
+    for name, values in id_values.items():
+        s = values if isinstance(values, pl.Series) else pl.Series(values)
+        if len(s) != n:
+            raise ValueError(f"id_values[{name!r}] has {len(s)} values; expected n={n}")
+        out[name] = s.alias(name)
+    return out

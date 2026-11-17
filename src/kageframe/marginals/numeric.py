@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
+from .._frame import dtype_name, float_array, to_strings
 from ..latent import interval_scores
 from ..schema import NumericColumn, Quantiles, WarningRecord
 from ..types import ColumnType
@@ -28,12 +29,11 @@ def round_value(v: float, decimals: int | None) -> float:
     return float(v) if decimals is None else float(np.round(v, decimals))
 
 
-def to_float_array(series: pd.Series) -> np.ndarray:
-    if pd.api.types.is_bool_dtype(series.dtype):
-        series = series.astype("float64")
-    elif not pd.api.types.is_numeric_dtype(series.dtype):
-        series = pd.to_numeric(series, errors="coerce")
-    return series.astype("float64").to_numpy(dtype=float, na_value=np.nan)
+def to_float_array(series: pl.Series) -> np.ndarray:
+    """Values as floats, NaN where missing (strings that are not numbers become NaN)."""
+    if series.dtype == pl.Boolean or series.dtype.is_numeric():
+        return float_array(series)
+    return float_array(to_strings(series).str.strip_chars().cast(pl.Float64, strict=False))
 
 
 def score_feature(x_all: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -70,7 +70,7 @@ def too_few_values(name: str, k: int) -> WarningRecord:
                          "and the column is generated as missing.")
 
 
-def profile_numeric(name: str, series: pd.Series, *, n_rows: int,
+def profile_numeric(name: str, series: pl.Series, *, n_rows: int,
                     options: dict[str, Any]) -> ColumnResult:
     x_all = to_float_array(series)
     x = x_all[~np.isnan(x_all)]
@@ -82,7 +82,7 @@ def profile_numeric(name: str, series: pd.Series, *, n_rows: int,
     feature, cells = score_feature(x_all)
 
     common: dict[str, Any] = dict(
-        name=name, type=ColumnType.NUMERIC, source_dtype=str(series.dtype), n_nonmissing=n,
+        name=name, type=ColumnType.NUMERIC, source_dtype=dtype_name(series.dtype), n_nonmissing=n,
         missing_rate=1 - n / n_rows, subtype="integer" if integer else "float",
         decimals=decimals, mean=float(np.mean(x)),
         sd=float(np.std(x, ddof=1)) if n > 1 else None,

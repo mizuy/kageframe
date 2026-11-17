@@ -3,7 +3,7 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 from scipy import stats
 
@@ -64,9 +64,9 @@ def _equicorrelation(rho: float, signs=(1, 1, 1, 1)) -> np.ndarray:
     return d @ (np.full((4, 4), rho) + (1 - rho) * np.eye(4)) @ d
 
 
-def _simulated(n: int, cov: np.ndarray, seed: int) -> pd.DataFrame:
+def _simulated(n: int, cov: np.ndarray, seed: int) -> pl.DataFrame:
     z = np.random.default_rng(seed).multivariate_normal(np.zeros(4), cov, size=n)
-    return pd.DataFrame({
+    return pl.DataFrame({
         "x": np.exp(z[:, 0]),
         "b1": (z[:, 1] > stats.norm.ppf(0.85)).astype(int),
         "b2": (z[:, 2] > stats.norm.ppf(0.3)).astype(int),
@@ -86,13 +86,15 @@ def test_latent_correlation_recovered_for_mixed_types(rho, signs) -> None:
 def test_pairwise_missing_uses_joint_rows() -> None:
     df = _simulated(20000, _equicorrelation(0.5), seed=4)
     rng = np.random.default_rng(5)
-    df["x"] = df["x"].mask(rng.random(len(df)) < 0.3)
-    df["o"] = df["o"].astype("Int64").mask(rng.random(len(df)) < 0.4)
+    hide_x = pl.Series(rng.random(len(df)) < 0.3)
+    hide_o = pl.Series(rng.random(len(df)) < 0.4)
+    df = df.with_columns(pl.when(hide_x).then(None).otherwise(pl.col("x")).alias("x"),
+                         pl.when(hide_o).then(None).otherwise(pl.col("o")).alias("o"))
     p = profile_dataframe(df, types=MIXED_TYPES)
     labels, m = _latent(p)
     assert np.max(np.abs(m[np.triu_indices(4, 1)] - 0.5)) < 0.04
     i, j = labels.index("x"), labels.index("o")
-    expected = int((df["x"].notna() & df["o"].notna()).sum())
+    expected = int((df["x"].is_not_null() & df["o"].is_not_null()).sum())
     assert p.dependence.observed.n_pairs[i][j] == expected
 
 
@@ -102,7 +104,7 @@ def test_sparse_pairs_set_to_zero_and_warn() -> None:
     z = rng.normal(size=n)
     a = np.where(np.arange(n) < 200, z, np.nan)
     b = np.where(np.arange(n) >= 190, z + 0.01 * rng.normal(size=n), np.nan)
-    df = pd.DataFrame({"a": a, "b": b})
+    df = pl.DataFrame({"a": a, "b": b})
     with pytest.warns(KageFrameWarning, match="jointly observed"):
         p = profile_dataframe(df)
     assert p.dependence.latent.matrix[0][1] == 0.0
@@ -174,5 +176,5 @@ def test_latent_matrix_is_positive_definite(clinical_profile) -> None:
 def test_no_latent_columns() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        p = profile_dataframe(pd.DataFrame({"id": [f"P{i:05d}" for i in range(200)]}))
+        p = profile_dataframe(pl.DataFrame({"id": [f"P{i:05d}" for i in range(200)]}))
     assert p.latent_labels() == []

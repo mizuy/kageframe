@@ -10,10 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
+from ._frame import prepare, to_strings
 from .latent import interval_scores
-from .marginals.categorical import normalize_values, value_kind
+from .marginals.categorical import cast_scalar
 from .marginals.numeric import to_float_array
 from .marginals.temporal import date_time_parts, time_seconds, to_timestamps
 from .schema import (
@@ -101,19 +102,20 @@ class CompareReport:
     def columns_match(self) -> bool:
         return self.actual_columns == self.expected_columns
 
-    def summary(self) -> pd.DataFrame:
+    def summary(self) -> pl.DataFrame:
         """One row per column: missing rate, marginal distances and worst correlation."""
-        df = pd.DataFrame(self.marginals).set_index("column")
         worst: dict[str, float] = {}
         for r in self.correlations:
             for c in (r["column_a"], r["column_b"]):
                 worst[c] = max(worst.get(c, 0.0), r["abs_diff"])
-        df["max_corr_diff"] = pd.Series(worst)
-        return df
+        rows = [_jsonable({**r, "max_corr_diff": worst.get(r["column"])})
+                for r in self.marginals]
+        return pl.from_dicts(rows, infer_schema_length=None)
 
-    def correlation_table(self) -> pd.DataFrame:
+    def correlation_table(self) -> pl.DataFrame:
         """One row per latent pair: profile vs dummy observed and generation-space values."""
-        return pd.DataFrame(self.correlations)
+        return pl.from_dicts([_jsonable(r) for r in self.correlations],
+                             infer_schema_length=None)
 
     def correlation_summary(self) -> dict[str, float | None]:
         """Largest absolute and RMS differences of the latent correlations."""
@@ -280,19 +282,31 @@ def _numeric_metrics(col: NumericColumn, x: np.ndarray) -> dict[str, Any]:
     return out
 
 
-def _categorical_values(col: CategoricalColumn, s: pd.Series,
-                        inverse: Mapping[str, Any] | None) -> np.ndarray:
-    values = s[s.notna()]
-    if inverse is not None:
-        values = values.map(lambda v: inverse.get(str(v), v))
+def _categorical_values(col: CategoricalColumn, s: pl.Series,
+                        inverse: Mapping[str, Any] | None) -> list[Any]:
+    """Non-missing values mapped back to pseudonyms and cast to the profile's level kind.
+
+    Values that cannot be cast are kept as they are (they count as unseen levels).
+    """
     kind = col.value_kind
-    try:
-        return normalize_values(values, kind if kind == value_kind(values) else "str")
-    except (TypeError, ValueError):
-        return values.astype(object).to_numpy()
+    out = []
+    for v in s.drop_nulls().to_list():
+        if inverse is not None:
+            v = inverse.get(str(v), v)
+        if kind == "str":
+            out.append(str(v))
+            continue
+        if isinstance(v, str) or (kind != "bool" and isinstance(v, bool)):
+            out.append(v)
+            continue
+        try:
+            out.append(cast_scalar(v, kind))
+        except (TypeError, ValueError):
+            out.append(v)
+    return out
 
 
-def _column_metrics(col: ColumnProfile, s: pd.Series, inverse: Mapping[str, Any] | None
+def _column_metrics(col: ColumnProfile, s: pl.Series, inverse: Mapping[str, Any] | None
                     ) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if isinstance(col, NumericColumn):
@@ -300,9 +314,7 @@ def _column_metrics(col: ColumnProfile, s: pd.Series, inverse: Mapping[str, Any]
         out.update(_numeric_metrics(col, x[~np.isnan(x)]))
     elif isinstance(col, CategoricalColumn):
         values = _categorical_values(col, s, inverse)
-        if col.value_kind == "str":
-            values = np.array([str(v) for v in values], dtype=object)
-        out.update(_frequency_metrics(values.tolist(), list(col.levels), col.probabilities))
+        out.update(_frequency_metrics(values, list(col.levels), col.probabilities))
     elif isinstance(col, DateColumn):
         days, _ = date_time_parts(to_timestamps(s)[0])
         out["grid_ks"] = grid_ks(days[~np.isnan(days)], col.date_part.grid)
@@ -315,10 +327,9 @@ def _column_metrics(col: ColumnProfile, s: pd.Series, inverse: Mapping[str, Any]
         secs = time_seconds(s)
         out["grid_ks"] = grid_ks(secs[~np.isnan(secs)], col.time_part.grid)
     elif isinstance(col, ConstantColumn):
-        values = s.dropna().astype(str)
-        out["constant_ok"] = bool(values.nunique() <= 1)
+        out["constant_ok"] = bool(to_strings(s).drop_nulls().n_unique() <= 1)
     elif isinstance(col, IdColumn):
-        out["unique_ok"] = bool(s.dropna().is_unique)
+        out["unique_ok"] = bool(s.drop_nulls().is_unique().all())
     return out
 
 
@@ -327,7 +338,7 @@ def _column_metrics(col: ColumnProfile, s: pd.Series, inverse: Mapping[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def _reprofile_types(profile: Profile, dummy: pd.DataFrame) -> dict[str, Any]:
+def _reprofile_types(profile: Profile, dummy: pl.DataFrame) -> dict[str, Any]:
     types: dict[str, Any] = {}
     for col in profile.columns:
         if col.name not in dummy.columns:
@@ -341,27 +352,26 @@ def _reprofile_types(profile: Profile, dummy: pd.DataFrame) -> dict[str, Any]:
     return types
 
 
-def _dummy_for_reprofile(profile: Profile, dummy: pd.DataFrame,
-                         inverse: Mapping[str, Mapping[str, Any]]) -> pd.DataFrame:
+_KIND_DTYPES = {"int": pl.Int64, "float": pl.Float64, "bool": pl.Boolean, "str": pl.String}
+
+
+def _dummy_for_reprofile(profile: Profile, dummy: pl.DataFrame,
+                         inverse: Mapping[str, Mapping[str, Any]]) -> pl.DataFrame:
     """Dummy restricted to profiled columns, levels mapped back and unseen values blanked."""
-    out = {}
+    out = []
     for col in profile.columns:
         if col.name not in dummy.columns:
             continue
         s = dummy[col.name]
         if isinstance(col, CategoricalColumn):
-            values = pd.Series(_categorical_values(col, s, inverse.get(col.name)),
-                               index=s.index[s.notna()])
-            if col.value_kind == "str":
-                values = values.map(str)
-            known = {repr(lv) for lv in col.levels}
-            values = values[[repr(v) in known for v in values]]
-            s = values.reindex(s.index).astype(object)
-            if col.value_kind in ("int", "float", "bool"):
-                s = s.astype({"int": "Int64", "float": "float64", "bool": "boolean"}
-                             [col.value_kind])
-        out[col.name] = s
-    return pd.DataFrame(out, index=dummy.index)
+            known = {repr(lv): lv for lv in col.levels}
+            values = _categorical_values(col, s, inverse.get(col.name))
+            mapped = iter([known.get(repr(v)) for v in values])
+            present = s.is_not_null().to_list()
+            s = pl.Series(col.name, [next(mapped) if p else None for p in present],
+                          dtype=_KIND_DTYPES[col.value_kind])
+        out.append(s)
+    return pl.DataFrame(out)
 
 
 def _label_kind(profile: Profile, column: str) -> str:
@@ -481,7 +491,7 @@ def _inverse_level_map(level_map: LevelMap | dict | str | Path | None
             for col, m in level_map.columns.items()}
 
 
-def compare(profile: Profile, dummy: pd.DataFrame, *,
+def compare(profile: Profile, dummy: pl.DataFrame | pl.LazyFrame, *,
             level_map: LevelMap | dict | str | Path | None = None) -> CompareReport:
     """Compare ``dummy`` with ``profile`` column by column and pair by pair.
 
@@ -496,8 +506,9 @@ def compare(profile: Profile, dummy: pd.DataFrame, *,
     """
     from .profile import profile_dataframe  # local import: profile imports generate deps
 
+    dummy = prepare(dummy)
     inverse = _inverse_level_map(level_map)
-    n = len(dummy)
+    n = dummy.height
     marginals = []
     for col in profile.columns:
         if not col.in_output:
@@ -508,7 +519,7 @@ def compare(profile: Profile, dummy: pd.DataFrame, *,
                                   "missing_rate_profile": col.missing_rate}
         if present:
             s = dummy[col.name]
-            n_obs = int(s.notna().sum())
+            n_obs = len(s) - s.null_count()
             record.update(missing_rate_dummy=1 - n_obs / n if n else float("nan"),
                           n_nonmissing_dummy=n_obs)
             record["missing_rate_diff"] = record["missing_rate_dummy"] - col.missing_rate

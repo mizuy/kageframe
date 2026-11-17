@@ -8,8 +8,9 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
+from ._frame import dtype_name, prepare
 from .dependence import nominal_fixed_mask, observed_to_latent, pairwise_latent_correlation
 from .exceptions import KageFrameWarning, PrivacyWarning
 from .marginals import ColumnResult
@@ -38,61 +39,56 @@ _PRIVACY_CODES = {"rare_levels_merged", "rare_levels_folded", "rare_binary_level
                   "rare_ordinal_level"}
 
 
-def _constant(name: str, series: pd.Series, n_rows: int) -> ColumnResult:
-    values = series.dropna()
-    v = values.iloc[0]
-    if isinstance(v, (pd.Timestamp, _dt.datetime)):
-        ts = pd.Timestamp(v)
-        is_date = ts == ts.normalize()
-        value, kind = (ts.date().isoformat(), "date") if is_date else (ts.isoformat(), "datetime")
+def _constant(name: str, series: pl.Series, n_rows: int) -> ColumnResult:
+    values = series.drop_nulls()
+    v = values[0]
+    if isinstance(v, _dt.datetime):
+        is_date = v.time() == _dt.time(0)
+        value, kind = (v.date().isoformat(), "date") if is_date else (v.isoformat(), "datetime")
     elif isinstance(v, _dt.date):
         value, kind = v.isoformat(), "date"
     elif isinstance(v, _dt.time):
         value, kind = v.isoformat(), "time"
-    elif isinstance(v, (bool, np.bool_)):
+    elif isinstance(v, bool):
         value, kind = bool(v), "bool"
-    elif isinstance(v, (int, np.integer)):
+    elif isinstance(v, int):
         value, kind = int(v), "int"
-    elif isinstance(v, (float, np.floating)) and np.isfinite(v):
+    elif isinstance(v, float) and np.isfinite(v):
         value, kind = float(v), "float"
     else:
         value, kind = str(v), "str"
-    column = ConstantColumn(name=name, type=ColumnType.CONSTANT, source_dtype=str(series.dtype),
-                            n_nonmissing=len(values), missing_rate=1 - len(values) / n_rows,
-                            value=value, value_kind=kind)
+    column = ConstantColumn(name=name, type=ColumnType.CONSTANT,
+                            source_dtype=dtype_name(series.dtype), n_nonmissing=len(values),
+                            missing_rate=1 - len(values) / n_rows, value=value, value_kind=kind)
     return ColumnResult(column)
 
 
-def _reason(name: str, t: ColumnType, series: pd.Series, n_rows: int,
+def _reason(name: str, t: ColumnType, series: pl.Series, n_rows: int,
             reason: str) -> ColumnResult:
-    n = int(series.notna().sum())
-    return ColumnResult(ReasonColumn(name=name, type=t, source_dtype=str(series.dtype),
+    n = len(series) - series.null_count()
+    return ColumnResult(ReasonColumn(name=name, type=t, source_dtype=dtype_name(series.dtype),
                                      n_nonmissing=n, missing_rate=1 - n / n_rows, reason=reason))
 
 
-def _profile_column(name: str, series: pd.Series, spec: TypeSpec, n_rows: int,
+def _profile_column(name: str, series: pl.Series, spec: TypeSpec, n_rows: int,
                     options: dict[str, Any]) -> ColumnResult:
     t = spec.type
+    n = len(series) - series.null_count()
     if t is ColumnType.ID:
-        n = int(series.notna().sum())
-        numeric = pd.api.types.is_numeric_dtype(series.dtype) and not \
-            pd.api.types.is_bool_dtype(series.dtype)
-        return ColumnResult(IdColumn(name=name, type=t, source_dtype=str(series.dtype),
+        return ColumnResult(IdColumn(name=name, type=t, source_dtype=dtype_name(series.dtype),
                                      n_nonmissing=n, missing_rate=1 - n / n_rows,
-                                     value_kind="int" if numeric else "str",
+                                     value_kind="int" if series.dtype.is_numeric() else "str",
                                      reason=spec.reason or "identifier"))
     if t is ColumnType.TEXT:
         return _reason(name, t, series, n_rows, spec.reason or "free text")
     if t is ColumnType.EXCLUDED:
-        return _reason(name, t, series, n_rows, "excluded by the user")
-    if series.notna().sum() == 0:
+        return _reason(name, t, series, n_rows, spec.reason if spec.source == "inferred"
+                       else "excluded by the user")
+    if n == 0:
         return _reason(name, ColumnType.EMPTY, series, n_rows, "all values missing")
     explicit_levels = t in CATEGORICAL_TYPES and spec.levels is not None \
         and spec.source == "override"
-    try:
-        n_unique = series.nunique()
-    except TypeError:
-        n_unique = series.dropna().astype(str).nunique()
+    n_unique = series.drop_nulls().n_unique()
     if t is ColumnType.CONSTANT or (n_unique == 1 and not explicit_levels):
         return _constant(name, series, n_rows)
     if t is ColumnType.NUMERIC:
@@ -147,7 +143,7 @@ def _estimate_dependence(results: list[ColumnResult], n_rows: int, options: dict
 
 
 def profile_dataframe(
-    df: pd.DataFrame,
+    df: pl.DataFrame | pl.LazyFrame,
     types: Mapping[str, Any] | None = None,
     *,
     pseudonymize: Sequence[str] | None = None,
@@ -164,7 +160,8 @@ def profile_dataframe(
     Parameters
     ----------
     df:
-        The real DataFrame. It is only read; nothing row-level is kept.
+        The real data as a Polars DataFrame (a LazyFrame is collected). It is only read;
+        nothing row-level is kept. Float NaN and null both count as missing.
     types:
         Per-column overrides, e.g. ``{"stage": {"type": "ordinal", "levels": ["I", "II",
         "III"]}, "ecog": "ordinal", "memo": "excluded"}``. Columns not listed are
@@ -196,7 +193,8 @@ def profile_dataframe(
         Warnings raised while profiling are emitted (``PrivacyWarning`` for privacy
         relevant ones) and also recorded in ``profile.warnings``.
     """
-    n_rows = len(df)
+    df = prepare(df)
+    n_rows = df.height
     if n_rows == 0:
         raise ValueError("df has no rows")
     options = dict(DEFAULT_OPTIONS)

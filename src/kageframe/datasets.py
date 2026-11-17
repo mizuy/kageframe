@@ -7,7 +7,7 @@ information. They are used as test fixtures and in examples.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from scipy import stats
 
 LATENT_LABELS: tuple[str, ...] = (
@@ -117,8 +117,8 @@ def make_clinical_like_df(
     *,
     missing: bool = True,
     edge_cases: bool = False,
-) -> pd.DataFrame:
-    """Generate a DataFrame containing every column type supported by kageframe.
+) -> pl.DataFrame:
+    """Generate a Polars DataFrame containing every column type supported by kageframe.
 
     Columns: ``patient_id`` (id), ``age``/``bmi``/``crp`` (numeric; integer ties,
     one decimal, point mass at zero), ``sex`` (binary strings), ``smoker`` (binary
@@ -164,14 +164,15 @@ def make_clinical_like_df(
         start += count
 
     exam_days = np.floor(u["exam_date"] * _N_DAYS).astype(np.int64)
-    exam_date = pd.to_datetime(_EPOCH + exam_days)
+    exam_date = (_EPOCH + exam_days).astype("datetime64[us]")
     admit_days = np.floor(u["admit_dt::date"] * _N_DAYS).astype(np.int64)
     admit_seconds = np.clip(
         np.round(stats.norm.ppf(u["admit_dt::time"], 13 * 3600, 3.5 * 3600) / 60) * 60,
         0,
         86340,
     ).astype(np.int64)
-    admit_dt = pd.to_datetime(_EPOCH + admit_days) + pd.to_timedelta(admit_seconds, unit="s")
+    admit_dt = ((_EPOCH + admit_days).astype("datetime64[s]")
+                + admit_seconds.astype("timedelta64[s]")).astype("datetime64[us]")
     visit_minutes = np.clip(
         np.round(stats.norm.ppf(u["visit_time"], 10.5 * 60, 90)), 6 * 60, 20 * 60
     ).astype(np.int64)
@@ -192,41 +193,39 @@ def make_clinical_like_df(
         dtype=object,
     )
 
-    df = pd.DataFrame(
+    df = pl.DataFrame(
         {
-            "patient_id": patient_id,
+            "patient_id": pl.Series(patient_id.tolist(), dtype=pl.String),
             "age": age,
             "bmi": bmi,
             "crp": crp,
-            "sex": sex,
+            "sex": pl.Series(sex.tolist(), dtype=pl.String),
             "smoker": smoker,
-            "stage": stage,
+            "stage": pl.Series(stage.tolist(), dtype=pl.String),
             "ecog": ecog,
-            "indication": indication,
+            "indication": pl.Series(indication.tolist(), dtype=pl.String),
             "exam_date": exam_date,
             "admit_dt": admit_dt,
-            "visit_time": visit_time,
+            "visit_time": pl.Series(visit_time.tolist(), dtype=pl.String),
             "lab_flag": lab_flag,
-            "note": note,
+            "note": pl.Series(note.tolist(), dtype=pl.String),
         }
     )
 
     if missing:
+        masked = []
         for name, rate in MISSING_RATES.items():
             k = int(round(rate * n))
             if k == 0:
                 continue
             mask = np.zeros(n, dtype=bool)
             mask[rng.choice(n, size=k, replace=False)] = True
-            series = df[name]
-            if pd.api.types.is_bool_dtype(series):
-                series = series.astype("boolean")
-            elif pd.api.types.is_integer_dtype(series):
-                series = series.astype("Int64")
-            df[name] = series.mask(mask)
+            masked.append(pl.when(pl.lit(pl.Series(mask))).then(None).otherwise(pl.col(name))
+                          .alias(name))
+        df = df.with_columns(masked)
 
     if edge_cases:
-        df["site"] = "A"
-        df["unused"] = np.full(n, np.nan)
+        df = df.with_columns(pl.lit("A").alias("site"),
+                             pl.lit(None, dtype=pl.Float64).alias("unused"))
 
     return df
