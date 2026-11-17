@@ -92,6 +92,14 @@ def _merge_rare_nominal(name: str, levels: list[Scalar], counts: np.ndarray, k: 
     if existing is not None:
         keep.append(existing)
         mapping[existing] = len(keep) - 1
+    if not keep:
+        # Every level is rare and they are too few even pooled: keep no real value.
+        other = OTHER_FALLBACK if any(str(lv).lower() == "other" for lv in levels) else OTHER
+        mapping[:] = 0
+        warnings.append(WarningRecord(name, "rare_levels_folded",
+                                      f"all {len(levels)} levels have fewer than {k} rows in "
+                                      f"total; every value became {other!r}."))
+        return [other], mapping, other, len(merged), warnings
     target = max(range(len(keep)), key=lambda j: counts[keep[j]])
     mapping[merged] = target
     warnings.append(WarningRecord(name, "rare_levels_folded",

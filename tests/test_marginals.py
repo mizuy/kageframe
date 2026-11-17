@@ -242,3 +242,16 @@ def test_invalid_options() -> None:
         profile_dataframe(df, rare_threshold=0)
     with pytest.raises(ValueError):
         profile_dataframe(df.head(0))
+
+
+def test_nominal_all_rare_and_too_few_pooled() -> None:
+    # 3 distinct values, 1 row each: no level and no pool reaches k, so no value is kept.
+    df = pl.DataFrame({"v": ["alpha", "beta", "gamma", None, None]})
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prof = profile_dataframe(df, types={"v": "nominal"})
+    col = prof.column("v")
+    assert col.type is T.CONSTANT and col.value == "Other"
+    text = prof.to_json()
+    for level in ("alpha", "beta", "gamma"):
+        assert level not in text
