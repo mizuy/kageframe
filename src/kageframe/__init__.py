@@ -1,4 +1,4 @@
-"""KageFrame - a statistical shadow of your DataFrame.
+"""KageFrame - a statistical shadow of your (Polars) DataFrame.
 
 Profile a (clinical) DataFrame locally into aggregate statistics, then generate dummy data
 with the same columns, similar marginal distributions, missing rates and rough pairwise

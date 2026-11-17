@@ -4,7 +4,7 @@ import json
 import warnings
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 from kageframe import generate, profile_dataframe
@@ -22,7 +22,7 @@ from kageframe.schema import (
 from kageframe.types import ColumnType as T
 
 
-def quiet_profile(df: pd.DataFrame, **kwargs) -> Profile:
+def quiet_profile(df: pl.DataFrame, **kwargs) -> Profile:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return profile_dataframe(df, **kwargs)
@@ -46,7 +46,7 @@ def test_numeric_quantile_grid_follows_k_rule(clinical_df, clinical_profile) -> 
     for name in ("age", "bmi", "crp"):
         col = clinical_profile.column(name)
         assert isinstance(col, NumericColumn) and col.mode == "quantile"
-        x = np.sort(clinical_df[name].dropna().to_numpy(dtype=float))
+        x = np.sort(clinical_df[name].drop_nulls().cast(pl.Float64).to_numpy())
         n = len(x)
         probs = np.array(col.grid.probs)
         assert probs[0] == 0.0 and probs[-1] == 1.0
@@ -62,7 +62,7 @@ def test_numeric_true_extremes_not_in_profile() -> None:
     rng = np.random.default_rng(3)
     x = np.round(rng.normal(50, 10, 5000), 3)
     x[0], x[1] = -123.456, 987.654
-    p = quiet_profile(pd.DataFrame({"x": x}))
+    p = quiet_profile(pl.DataFrame({"x": x}))
     text = p.to_json()
     assert "-123.456" not in text and "987.654" not in text
     col = p.column("x")
@@ -78,14 +78,14 @@ def test_numeric_subtype_and_decimals(clinical_profile) -> None:
 
 def test_small_grid_for_small_n() -> None:
     x = np.arange(200, dtype=float) + 0.5
-    col = quiet_profile(pd.DataFrame({"x": x})).column("x")
+    col = quiet_profile(pl.DataFrame({"x": x})).column("x")
     assert len(col.grid.probs) <= 200 // 10 + 6
 
 
 def test_numeric_discrete_mode() -> None:
     rng = np.random.default_rng(0)
     x = rng.choice([0, 1, 2, 3], p=[0.3, 0.4, 0.2, 0.1], size=2000)
-    p = quiet_profile(pd.DataFrame({"pain": x}), types={"pain": "numeric"})
+    p = quiet_profile(pl.DataFrame({"pain": x}), types={"pain": "numeric"})
     col = p.column("pain")
     assert col.mode == "discrete" and col.support == [0.0, 1.0, 2.0, 3.0]
     assert np.allclose(col.probabilities, np.bincount(x) / len(x))
@@ -93,7 +93,7 @@ def test_numeric_discrete_mode() -> None:
 
 def test_numeric_rare_value_disables_discrete_mode() -> None:
     x = np.array([0] * 500 + [1] * 500 + [2] * 3)
-    col = quiet_profile(pd.DataFrame({"x": x}), types={"x": "numeric"}).column("x")
+    col = quiet_profile(pl.DataFrame({"x": x}), types={"x": "numeric"}).column("x")
     assert col.mode == "quantile" and col.support is None
 
 
@@ -101,13 +101,13 @@ def test_numeric_rare_value_disables_discrete_mode() -> None:
 def test_numeric_too_few_values() -> None:
     x = np.full(100, np.nan)
     x[:15] = np.arange(15) + 0.5
-    df = pd.DataFrame({"x": x, "y": np.arange(100) + 0.25})
+    df = pl.DataFrame({"x": x, "y": np.arange(100) + 0.25})
     with pytest.warns(KageFrameWarning, match="fewer than 20"):
         p = profile_dataframe(df)
     col = p.column("x")
     assert col.grid is None and col.min is None and "too_few_values" in warning_codes(p, "x")
     g = generate(p, seed=0)
-    assert g["x"].isna().all() and g["y"].notna().all()
+    assert g["x"].is_null().all() and g["y"].is_not_null().all()
 
 
 # --- categorical ---------------------------------------------------------------------------
@@ -116,7 +116,7 @@ def test_numeric_too_few_values() -> None:
 def test_binary_and_ordinal_levels(clinical_df, clinical_profile) -> None:
     sex = clinical_profile.column("sex")
     assert sex.type is T.BINARY and sex.levels == ["F", "M"] and not sex.pseudonymized
-    freq = clinical_df["sex"].value_counts(normalize=True)
+    freq = dict(clinical_df["sex"].value_counts(normalize=True).iter_rows())
     assert sex.probabilities == pytest.approx([freq["F"], freq["M"]])
     assert len(sex.thresholds) == 1
 
@@ -134,14 +134,14 @@ def test_nominal_frequency_order_and_fold(clinical_df, clinical_profile) -> None
     assert col.type is T.NOMINAL and col.other_level is None
     assert col.levels == ["surveillance", "diagnostic", "screening", "FIT_positive"]
     assert np.all(np.diff(col.counts) <= 0)
-    assert sum(col.counts) == clinical_df["indication"].notna().sum()
+    assert sum(col.counts) == clinical_df["indication"].is_not_null().sum()
     assert "rare_levels_folded" in warning_codes(clinical_profile, "indication")
     for level in RARE_INDICATIONS:
         assert level not in clinical_profile.to_json()
 
 
-def _nominal(counts: dict[str, int]) -> pd.DataFrame:
-    return pd.DataFrame({"v": [lv for lv, c in counts.items() for _ in range(c)]})
+def _nominal(counts: dict[str, int]) -> pl.DataFrame:
+    return pl.DataFrame({"v": [lv for lv, c in counts.items() for _ in range(c)]})
 
 
 def test_rare_nominal_levels_merged_into_other() -> None:
@@ -164,7 +164,7 @@ def test_rare_merge_joins_existing_other_and_avoids_case_clash() -> None:
 
 
 def test_rare_binary_level_warns_and_single_level_becomes_constant() -> None:
-    df = pd.DataFrame({"b": ["y"] * 995 + ["n"] * 5, "c": ["x"] * 995 + [None] * 5})
+    df = pl.DataFrame({"b": ["y"] * 995 + ["n"] * 5, "c": ["x"] * 995 + [None] * 5})
     with pytest.warns(PrivacyWarning, match="fewer than 10"):
         p = profile_dataframe(df, types={"b": "binary"})
     assert p.column("b").counts == [5, 995]
@@ -204,11 +204,10 @@ def test_level_map_roundtrip(tmp_path, clinical_df) -> None:
     assert loaded.columns == p.level_map.columns
     pseudo = generate(p, seed=1)
     real = generate(p, seed=1, level_map=path)
-    assert set(pseudo["indication"].dropna()) == {"L01", "L02", "L03", "L04"}
-    mapped = pseudo["indication"].map(loaded.columns["indication"])
-    assert (mapped.isna() == real["indication"].isna()).all()
-    observed = real["indication"].notna()
-    assert (mapped[observed] == real["indication"][observed]).all()
+    assert set(pseudo["indication"].drop_nulls()) == {"L01", "L02", "L03", "L04"}
+    mapped = pseudo["indication"].replace_strict(loaded.columns["indication"], default=None)
+    assert (mapped.is_null() == real["indication"].is_null()).all()
+    assert mapped.to_list() == real["indication"].to_list()
 
 
 # --- non-distribution columns --------------------------------------------------------------
@@ -226,7 +225,7 @@ def test_special_columns(clinical_profile) -> None:
 
 
 def test_user_excluded_column() -> None:
-    df = pd.DataFrame({"a": np.arange(100) + 0.5, "b": np.arange(100) * 2.0})
+    df = pl.DataFrame({"a": np.arange(100) + 0.5, "b": np.arange(100) * 2.0})
     p = quiet_profile(df, types={"b": "excluded"})
     assert p.column("b").type is T.EXCLUDED and "b" not in generate(p, seed=0).columns
 
@@ -238,8 +237,8 @@ def test_profile_is_deterministic_and_roundtrips(clinical_df, clinical_profile) 
 
 
 def test_invalid_options() -> None:
-    df = pd.DataFrame({"a": np.arange(100) + 0.5})
+    df = pl.DataFrame({"a": np.arange(100) + 0.5})
     with pytest.raises(ValueError):
         profile_dataframe(df, rare_threshold=0)
     with pytest.raises(ValueError):
-        profile_dataframe(df.iloc[:0])
+        profile_dataframe(df.head(0))

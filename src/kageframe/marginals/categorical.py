@@ -3,29 +3,26 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from scipy import special
 
+from .._frame import dtype_name, to_strings
 from ..latent import interval_scores, normal_pdf, thresholds
 from ..schema import CategoricalColumn, ConstantColumn, Scalar, WarningRecord
-from ..types import ColumnType, TypeSpec, has_string_levels
+from ..types import ColumnType, TypeSpec
 from . import ColumnResult
 
 OTHER = "Other"
 OTHER_FALLBACK = "__other__"
 
 
-def value_kind(series: pd.Series) -> str:
+def value_kind(series: pl.Series) -> str:
+    """``bool``, ``int``, ``float`` or ``str``: how the levels of ``series`` are stored."""
     dtype = series.dtype
-    if isinstance(dtype, pd.CategoricalDtype):
-        dtype = dtype.categories.dtype
-    values = series.dropna()
-    if pd.api.types.is_bool_dtype(dtype) or (
-        len(values) and all(isinstance(v, (bool, np.bool_)) for v in values.iloc[:1000])
-    ):
+    if dtype == pl.Boolean:
         return "bool"
-    if not has_string_levels(series) and pd.api.types.is_numeric_dtype(dtype):
-        arr = values.astype("float64").to_numpy()
+    if dtype.is_numeric():
+        arr = series.drop_nulls().cast(pl.Float64).to_numpy()
         return "int" if np.all(arr == np.round(arr)) else "float"
     return "str"
 
@@ -40,13 +37,22 @@ def cast_scalar(v: Any, kind: str) -> Scalar:
     return str(v)
 
 
-def normalize_values(values: pd.Series, kind: str) -> np.ndarray:
+def normalize_values(values: pl.Series, kind: str) -> np.ndarray:
+    """Non-missing ``values`` as a numpy array of the given kind."""
+    values = values.drop_nulls()
     if kind == "bool":
-        return values.astype(bool).to_numpy()
+        return values.cast(pl.Boolean).to_numpy()
     if kind in ("int", "float"):
-        arr = values.astype("float64").to_numpy()
+        arr = values.cast(pl.Float64).to_numpy().astype(float)
         return np.round(arr).astype(np.int64) if kind == "int" else arr
-    return values.astype(object).map(str).to_numpy(dtype=object)
+    return np.array(to_strings(values).to_list(), dtype=object)
+
+
+def level_codes(values: np.ndarray, levels: list[Scalar]) -> np.ndarray:
+    """Index of each value in ``levels`` (-1 if absent)."""
+    index = {lv: i for i, lv in enumerate(levels)}
+    return np.fromiter((index.get(v, -1) for v in values.tolist()), dtype=np.int64,
+                       count=len(values))
 
 
 def _sort_key(v: Scalar) -> tuple[int, Any]:
@@ -109,13 +115,13 @@ def _pseudonymize(levels: list[Scalar], counts: np.ndarray, ordered: bool,
     return new_levels, level_map
 
 
-def profile_categorical(name: str, series: pd.Series, spec: TypeSpec, *, n_rows: int,
+def profile_categorical(name: str, series: pl.Series, spec: TypeSpec, *, n_rows: int,
                         options: dict[str, Any]) -> ColumnResult:
     """Profile a binary/ordinal/nominal column (constant if it collapses to one level)."""
     t = spec.type
-    observed_mask = series.notna().to_numpy()
+    observed_mask = series.is_not_null().to_numpy()
     kind = value_kind(series)
-    values = normalize_values(series[observed_mask], kind)
+    values = normalize_values(series, kind)
     n = len(values)
     k = options["rare_threshold"]
     warnings: list[WarningRecord] = []
@@ -124,7 +130,7 @@ def profile_categorical(name: str, series: pd.Series, spec: TypeSpec, *, n_rows:
         levels: list[Scalar] = [cast_scalar(v, kind) for v in spec.levels]
     else:
         levels = sorted({cast_scalar(v, kind) for v in values}, key=_sort_key)
-    codes = pd.Categorical(values, categories=levels).codes.astype(np.int64)
+    codes = level_codes(values, levels)
     counts = np.bincount(codes, minlength=len(levels))
 
     other, n_merged = None, 0
@@ -153,7 +159,7 @@ def profile_categorical(name: str, series: pd.Series, spec: TypeSpec, *, n_rows:
         warnings.append(WarningRecord(name, "single_level",
                                       "only one level remains; stored as a constant column."))
         column = ConstantColumn(name=name, type=ColumnType.CONSTANT,
-                                source_dtype=str(series.dtype), n_nonmissing=n,
+                                source_dtype=dtype_name(series.dtype), n_nonmissing=n,
                                 missing_rate=1 - n / n_rows, value=value, value_kind=kind)
         return ColumnResult(column, warnings=warnings, level_map=level_map)
 
@@ -162,7 +168,7 @@ def profile_categorical(name: str, series: pd.Series, spec: TypeSpec, *, n_rows:
 
     probs = counts / n
     column = CategoricalColumn(
-        name=name, type=t, source_dtype=str(series.dtype), n_nonmissing=n,
+        name=name, type=t, source_dtype=dtype_name(series.dtype), n_nonmissing=n,
         missing_rate=1 - n / n_rows, levels=levels, counts=[int(c) for c in counts],
         probabilities=[float(p) for p in probs], value_kind=kind,
         pseudonymized=level_map is not None,

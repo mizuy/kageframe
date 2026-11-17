@@ -2,7 +2,7 @@ import datetime as dt
 import warnings
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 import kageframe
@@ -12,13 +12,19 @@ from kageframe.types import ColumnType as T
 from kageframe.types import infer_column_type, resolve_types
 
 
+def series(values, name="x", dtype=None) -> pl.Series:
+    if isinstance(values, np.ndarray):
+        values = values.tolist()
+    return pl.Series(name, values, dtype=dtype, strict=False)
+
+
 def infer(values, name="x", dtype=None) -> T:
-    spec, _ = infer_column_type(pd.Series(values, name=name, dtype=dtype))
+    spec, _ = infer_column_type(series(values, name, dtype))
     return spec.type
 
 
 def infer_warn_codes(values, name="x", dtype=None) -> list[str]:
-    _, warns = infer_column_type(pd.Series(values, name=name, dtype=dtype))
+    _, warns = infer_column_type(series(values, name, dtype))
     return [w.code for w in warns]
 
 
@@ -34,25 +40,25 @@ def test_fixture_types_are_inferred(clinical_df):
 
 def test_empty_and_constant():
     assert infer([np.nan, np.nan]) is T.EMPTY
-    assert infer([None, None], dtype=object) is T.EMPTY
+    assert infer([None, None]) is T.EMPTY
+    assert infer([None, None], dtype=pl.String) is T.EMPTY
     assert infer(["a", "a", None]) is T.CONSTANT
     assert infer([5, 5, 5]) is T.CONSTANT
 
 
 def test_bool_is_binary():
     assert infer([True, False, True]) is T.BINARY
-    assert infer([True, False, None], dtype="boolean") is T.BINARY
-    assert infer([True, False, None], dtype=object) is T.BINARY
+    assert infer([True, False, None]) is T.BINARY
 
 
 def test_integer_zero_one_is_binary():
     assert infer([0, 1, 1, 0]) is T.BINARY
     assert infer([0.0, 1.0, np.nan]) is T.BINARY
-    assert infer([0, 1, None], dtype="Int64") is T.BINARY
+    assert infer([0, 1, None], dtype=pl.Int64) is T.BINARY
 
 
 def test_integer_codes_up_to_ten_levels_are_ordinal_with_warning():
-    spec, warns = infer_column_type(pd.Series([1, 2, 3, 2, 1] * 20, name="grade"))
+    spec, warns = infer_column_type(pl.Series("grade", [1, 2, 3, 2, 1] * 20))
     assert spec.type is T.ORDINAL
     assert spec.levels == (1, 2, 3)
     assert [w.code for w in warns] == ["integer_code_as_ordinal"]
@@ -75,28 +81,31 @@ def test_integer_identifier_is_id():
     assert infer(np.random.default_rng(0).choice(10**9, 200, replace=False)) is T.NUMERIC
 
 
-def test_categorical_dtypes():
-    ordered = pd.Categorical(["lo", "hi", "mid"], categories=["lo", "mid", "hi"], ordered=True)
-    spec, _ = infer_column_type(pd.Series(ordered))
+def test_enum_and_categorical_dtypes():
+    spec, _ = infer_column_type(pl.Series(["lo", "hi", "mid"],
+                                          dtype=pl.Enum(["lo", "mid", "hi"])))
     assert spec.type is T.ORDINAL
     assert spec.levels == ("lo", "mid", "hi")
-    assert infer(pd.Categorical(["a", "b", "a"])) is T.BINARY
-    assert infer(pd.Categorical(["a", "b", "c"])) is T.NOMINAL
+    assert infer(["a", "b", "a"], dtype=pl.Categorical) is T.BINARY
+    assert infer(["a", "b", "c"], dtype=pl.Categorical) is T.NOMINAL
 
 
 def test_datetime_dtypes():
-    assert infer(pd.to_datetime(["2020-01-01", "2020-02-03", None])) is T.DATE
-    assert infer(pd.to_datetime(["2020-01-01 10:00", "2020-02-03 00:00"])) is T.DATETIME
-    tz = pd.to_datetime(["2020-01-01 10:00", "2020-01-02 11:00"]).tz_localize("Asia/Tokyo")
-    assert infer(tz) is T.DATETIME
-    assert infer(pd.to_timedelta(["1h", "2h"])) is T.TIME
+    assert infer([dt.datetime(2020, 1, 1), dt.datetime(2020, 2, 3), None]) is T.DATE
+    assert infer([dt.datetime(2020, 1, 1, 10), dt.datetime(2020, 2, 3)]) is T.DATETIME
+    tz = series([dt.datetime(2020, 1, 1, 10), dt.datetime(2020, 1, 2, 11)]) \
+        .dt.replace_time_zone("Asia/Tokyo")
+    assert infer_column_type(tz)[0].type is T.DATETIME
+    midnight_tz = series([dt.datetime(2020, 1, 1), dt.datetime(2020, 1, 2)]) \
+        .dt.replace_time_zone("Asia/Tokyo")
+    assert infer_column_type(midnight_tz)[0].type is T.DATE
+    assert infer([dt.timedelta(hours=1), dt.timedelta(hours=2)]) is T.TIME
 
 
-def test_python_temporal_objects():
-    assert infer([dt.date(2020, 1, 1), dt.date(2021, 5, 2)], dtype=object) is T.DATE
-    assert infer([dt.datetime(2020, 1, 1, 9), dt.datetime(2021, 5, 2)], dtype=object) \
-        is T.DATETIME
-    assert infer([dt.time(9, 30), dt.time(14, 0)], dtype=object) is T.TIME
+def test_python_temporal_values():
+    assert infer([dt.date(2020, 1, 1), dt.date(2021, 5, 2)]) is T.DATE
+    assert infer([dt.datetime(2020, 1, 1, 9), dt.datetime(2021, 5, 2)]) is T.DATETIME
+    assert infer([dt.time(9, 30), dt.time(14, 0)]) is T.TIME
 
 
 def test_temporal_strings():
@@ -131,8 +140,14 @@ def test_inference_itself_never_warns_about_pseudonymization():
     assert infer_warn_codes(["Dr. A", "Dr. B", "Dr. C"] * 5, name="doctor") == []
 
 
-def test_mixed_object_values_do_not_crash():
-    assert infer(["a", 1, 2.5, "a", 1], dtype=object) is T.NOMINAL
+def test_object_values_are_treated_as_strings():
+    assert infer(["a", 1, 2.5, "a", 1], dtype=pl.Object) is T.NOMINAL
+
+
+def test_nested_columns_are_excluded():
+    spec, warns = infer_column_type(pl.Series("x", [[1, 2], [3]]))
+    assert spec.type is T.EXCLUDED
+    assert [w.code for w in warns] == ["nested_excluded"]
 
 
 # -- overrides -------------------------------------------------------------------
@@ -140,7 +155,7 @@ def test_mixed_object_values_do_not_crash():
 
 @pytest.fixture
 def df():
-    return pd.DataFrame({
+    return pl.DataFrame({
         "stage": ["I", "II", "III", "IV", None] * 4,
         "code": [1, 2, 3, 2, 1] * 4,
         "sex": ["M", "F", "F", "M", "F"] * 4,
@@ -205,7 +220,7 @@ def test_binary_override_rejects_three_values(df):
 def test_numeric_override_rejects_strings(df):
     with pytest.raises(TypeSpecError, match="not numeric"):
         resolve_types(df, {"sex": "numeric"})
-    ok = pd.DataFrame({"x": ["1", "2.5", None]})
+    ok = pl.DataFrame({"x": ["1", "2.5", None]})
     assert resolve_types(ok, {"x": "numeric"}).specs["x"].type is T.NUMERIC
 
 
@@ -216,11 +231,10 @@ def test_unknown_columns_rejected(df):
         resolve_types(df, pseudonymize=["nope"])
 
 
-def test_column_name_checks():
-    with pytest.raises(TypeSpecError, match="duplicate"):
-        resolve_types(pd.DataFrame([[1, 2]], columns=["a", "a"]))
-    with pytest.raises(TypeSpecError, match="strings"):
-        resolve_types(pd.DataFrame([[1, 2]]))
+def test_only_polars_frames_are_accepted(df):
+    with pytest.raises(TypeError, match="pl.from_pandas"):
+        resolve_types(df.to_dicts())
+    assert resolve_types(df.lazy()).specs.keys() == resolve_types(df).specs.keys()
 
 
 # -- pseudonymization (opt-in) ----------------------------------------------------
@@ -255,10 +269,9 @@ def test_pseudonymize_argument_validation(df):
 
 
 def test_codes_and_booleans_are_never_pseudonymized():
-    frame = pd.DataFrame({"code": [1, 2, 3] * 10, "flag01": [0, 1] * 15,
-                          "flag": [True, False] * 15,
-                          "cat": pd.Categorical([1, 2, 3] * 10)})
-    res = resolve_types(frame, {"cat": "nominal"}, pseudonymize=list(frame.columns))
+    frame = pl.DataFrame({"code": [1, 2, 3] * 10, "flag01": [0, 1] * 15,
+                          "flag": [True, False] * 15, "score": [0.5, 1.5, 2.5] * 10})
+    res = resolve_types(frame, {"score": "nominal"}, pseudonymize=list(frame.columns))
     for name in frame.columns:
         assert res.specs[name].pseudonymize is False
         assert codes_for(res, name)[-1] == "pseudonymize_ignored"
@@ -274,7 +287,7 @@ def test_pseudonymize_on_non_categorical_inferred_column_is_ignored_with_warning
                                   "institution", "hospitalName", "attending_dr", "siteID",
                                   "patient_name", "病院名", "担当医師", "ward"])
 def test_sensitive_names_warn_to_consider_pseudonymization(name):
-    frame = pd.DataFrame({name: ["a", "b", "c"] * 10})
+    frame = pl.DataFrame({name: ["a", "b", "c"] * 10})
     res = resolve_types(frame)
     assert codes_for(res, name) == ["consider_pseudonymize"]
     assert res.specs[name].pseudonymize is False
@@ -285,12 +298,12 @@ def test_sensitive_names_warn_to_consider_pseudonymization(name):
 @pytest.mark.parametrize("name", ["indication", "stage", "sex", "idea", "consideration",
                                   "valid_flag", "insider"])
 def test_ordinary_names_do_not_warn(name):
-    frame = pd.DataFrame({name: ["a", "b", "c"] * 10})
+    frame = pl.DataFrame({name: ["a", "b", "c"] * 10})
     assert codes_for(resolve_types(frame), name) == []
 
 
 def test_high_cardinality_string_categorical_warns():
-    frame = pd.DataFrame({"x": [f"v{i}" for i in range(30)]})
+    frame = pl.DataFrame({"x": [f"v{i}" for i in range(30)]})
     res = resolve_types(frame)
     assert res.specs["x"].type is T.NOMINAL
     assert codes_for(res, "x") == ["consider_pseudonymize"]
@@ -298,7 +311,7 @@ def test_high_cardinality_string_categorical_warns():
 
 
 def test_sensitive_name_on_integer_codes_does_not_warn():
-    frame = pd.DataFrame({"hospital": [1, 2, 3] * 10})
+    frame = pl.DataFrame({"hospital": [1, 2, 3] * 10})
     assert "consider_pseudonymize" not in codes_for(resolve_types(frame), "hospital")
 
 
@@ -315,6 +328,6 @@ def test_infer_types_emits_python_warnings(df):
 
 
 def test_privacy_warning_category():
-    frame = pd.DataFrame({"pid": [f"P{i:06d}" for i in range(300)]})
+    frame = pl.DataFrame({"pid": [f"P{i:06d}" for i in range(300)]})
     with pytest.warns(PrivacyWarning):
         kageframe.infer_types(frame)

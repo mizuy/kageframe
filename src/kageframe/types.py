@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime as _dt
 import re
 import warnings
 from collections.abc import Mapping, Sequence
@@ -11,8 +10,9 @@ from enum import Enum
 from typing import Any, Literal
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
+from ._frame import check_columns, nonmissing, parse_datetime_strings, prepare, to_strings
 from .exceptions import PrivacyWarning, TypeInferenceWarning, TypeSpecError
 
 
@@ -125,67 +125,58 @@ class TypeResolution:
 # ---------------------------------------------------------------------------
 
 
-def _nonmissing(s: pd.Series) -> pd.Series:
-    return s[s.notna()]
-
-
-def _is_integer_valued(values: pd.Series) -> bool:
-    if pd.api.types.is_bool_dtype(values):
-        return False
-    if pd.api.types.is_integer_dtype(values):
+def _is_integer_valued(values: pl.Series) -> bool:
+    dtype = values.dtype
+    if dtype.is_integer():
         return True
-    if pd.api.types.is_float_dtype(values):
-        arr = values.to_numpy(dtype=float)
+    if dtype.is_float():
+        arr = values.to_numpy().astype(float)
         return bool(np.all(np.isfinite(arr)) and np.all(arr == np.round(arr)))
     return False
 
 
-def _all_instances(values: pd.Series, types: type | tuple[type, ...]) -> bool:
-    sample = values.iloc[:DATETIME_SAMPLE_SIZE]
-    return len(sample) > 0 and all(isinstance(v, types) for v in sample)
+def _is_midnight(values: pl.Series) -> bool:
+    """True if every (non-missing) datetime value has a zero time of day."""
+    if values.dtype.base_type() is pl.Datetime and values.dtype.time_zone is not None:
+        values = values.dt.replace_time_zone(None)
+    return bool((values.dt.truncate("1d") == values).all())
 
 
-def _is_midnight(values: pd.Series) -> bool:
-    dt = values.dt
-    return bool(
-        ((dt.hour == 0) & (dt.minute == 0) & (dt.second == 0) & (dt.microsecond == 0)
-         & (dt.nanosecond == 0)).all()
-    )
+def _match_rate(sample: pl.Series, *patterns: re.Pattern[str]) -> float:
+    if not len(sample):
+        return 0.0
+    hits = [any(p.match(v) for p in patterns) for v in sample.to_list()]
+    return sum(hits) / len(hits)
 
 
-def _match_rate(sample: pd.Series, *patterns: re.Pattern[str]) -> float:
-    hits = sample.map(lambda v: any(p.match(v) for p in patterns))
-    return float(hits.mean()) if len(sample) else 0.0
-
-
-def _infer_string_temporal(values: pd.Series) -> ColumnType | None:
-    sample = values.iloc[:DATETIME_SAMPLE_SIZE].astype(str)
+def _infer_string_temporal(values: pl.Series) -> ColumnType | None:
+    sample = values.head(DATETIME_SAMPLE_SIZE)
     if _match_rate(sample, _TIME_RE) >= DATETIME_MATCH_RATE:
         return ColumnType.TIME
     if _match_rate(sample, _DATE_RE, _DATETIME_RE) < DATETIME_MATCH_RATE:
         return None
-    parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
-    if parsed.notna().mean() < DATETIME_MATCH_RATE:
+    parsed, _ = parse_datetime_strings(sample)
+    if parsed.is_not_null().mean() < DATETIME_MATCH_RATE:
         return None
-    return ColumnType.DATE if _is_midnight(parsed.dropna()) else ColumnType.DATETIME
+    return ColumnType.DATE if _is_midnight(parsed.drop_nulls()) else ColumnType.DATETIME
 
 
-def _looks_like_integer_id(values: pd.Series) -> bool:
+def _looks_like_integer_id(values: pl.Series) -> bool:
     n = len(values)
-    n_unique = values.nunique()
+    n_unique = values.n_unique()
     if n_unique <= DEFAULT_MAX_LEVELS or n_unique / n < 0.99:
         return False
-    arr = values.to_numpy(dtype=float)
+    arr = values.to_numpy().astype(float)
     span = arr.max() - arr.min() + 1
-    return bool(values.is_monotonic_increasing or span / n_unique <= 1.1)
+    monotonic = bool(np.all(np.diff(arr) >= 0))
+    return bool(monotonic or span / n_unique <= 1.1)
 
 
-def _string_profile(values: pd.Series) -> tuple[int, float, float, float]:
-    strings = values.astype(str)
-    n_unique = strings.nunique()
+def _string_profile(strings: pl.Series) -> tuple[int, float, float, float]:
+    n_unique = strings.n_unique()
     unique_ratio = n_unique / len(strings)
-    avg_len = float(strings.str.len().mean())
-    frac_space = float(strings.str.contains(r"\s", regex=True).mean())
+    avg_len = float(strings.str.len_chars().mean())
+    frac_space = float(strings.str.contains(r"\s").mean())
     return n_unique, unique_ratio, avg_len, frac_space
 
 
@@ -195,56 +186,61 @@ def _string_profile(values: pd.Series) -> tuple[int, float, float, float]:
 
 
 def infer_column_type(
-    series: pd.Series,
+    series: pl.Series,
     *,
     max_levels: int = DEFAULT_MAX_LEVELS,
     ordinal_max_levels: int = DEFAULT_ORDINAL_MAX_LEVELS,
 ) -> tuple[TypeSpec, list[TypeWarning]]:
     """Infer the type of one column following the rules in the V0.1 plan (§2.2)."""
-    name = str(series.name)
+    name = series.name
     warns: list[TypeWarning] = []
-    values = _nonmissing(series)
+    if series.dtype.is_float():
+        series = series.fill_nan(None)
     dtype = series.dtype
+    base = dtype.base_type()
 
     def spec(t: ColumnType, reason: str, levels: tuple[Any, ...] | None = None) -> TypeSpec:
         return TypeSpec(type=t, levels=levels, source="inferred", reason=reason)
 
+    if base in (pl.List, pl.Array, pl.Struct):
+        warns.append(TypeWarning(name, "nested_excluded",
+                                 f"nested {base.__name__} column is not supported; excluded "
+                                 "from the output."))
+        return spec(ColumnType.EXCLUDED, f"nested {base.__name__} dtype"), warns
+    values = nonmissing(series)
     if len(values) == 0:
         return spec(ColumnType.EMPTY, "all values missing"), warns
-    try:
-        n_unique = values.nunique()
-    except TypeError:
-        values = values.astype(str)
-        n_unique = values.nunique()
+    if base is pl.Object:
+        values = to_strings(values)
+        dtype = base = pl.String
+    n_unique = values.n_unique()
     if n_unique == 1:
         return spec(ColumnType.CONSTANT, "single non-missing value"), warns
 
-    if pd.api.types.is_bool_dtype(dtype) or _all_instances(values, (bool, np.bool_)):
+    if base is pl.Boolean:
         return spec(ColumnType.BINARY, "boolean values"), warns
-
-    if isinstance(dtype, pd.CategoricalDtype):
-        if dtype.ordered:
-            return spec(ColumnType.ORDINAL, "ordered Categorical",
-                        tuple(dtype.categories.tolist())), warns
+    if base is pl.Enum:
+        return spec(ColumnType.ORDINAL, "Enum (ordered categories)",
+                    tuple(dtype.categories.to_list())), warns
+    if base is pl.Categorical:
         if n_unique == 2:
             return spec(ColumnType.BINARY, "Categorical with 2 observed levels"), warns
-        return spec(ColumnType.NOMINAL, "unordered Categorical"), warns
+        return spec(ColumnType.NOMINAL, "Categorical"), warns
 
-    if pd.api.types.is_datetime64_any_dtype(dtype):
+    if base is pl.Datetime:
         t = ColumnType.DATE if _is_midnight(values) else ColumnType.DATETIME
-        return spec(t, "datetime64 dtype"), warns
-    if pd.api.types.is_timedelta64_dtype(dtype) or _all_instances(values, _dt.time):
+        return spec(t, "Datetime dtype"), warns
+    if base is pl.Date:
+        return spec(ColumnType.DATE, "Date dtype"), warns
+    if base in (pl.Time, pl.Duration):
         return spec(ColumnType.TIME, "time-of-day values"), warns
-    if _all_instances(values, _dt.datetime):
-        parsed = pd.to_datetime(values)
-        t = ColumnType.DATE if _is_midnight(parsed) else ColumnType.DATETIME
-        return spec(t, "datetime objects"), warns
-    if _all_instances(values, _dt.date):
-        return spec(ColumnType.DATE, "date objects"), warns
 
-    if pd.api.types.is_numeric_dtype(dtype):
+    if dtype.is_decimal():
+        values = values.cast(pl.Float64)
+        dtype = pl.Float64()
+    if dtype.is_numeric():
         if _is_integer_valued(values):
-            unique = set(values.unique().tolist())
+            unique = set(values.unique().to_list())
             if unique == {0, 1}:
                 return spec(ColumnType.BINARY, "integer values {0, 1}"), warns
             if _looks_like_integer_id(values):
@@ -254,7 +250,7 @@ def infer_column_type(
                                          PrivacyWarning))
                 return spec(ColumnType.ID, "unique, (near) consecutive integers"), warns
             if n_unique <= ordinal_max_levels:
-                levels = tuple(sorted(unique))
+                levels = tuple(sorted(int(v) for v in unique))
                 warns.append(TypeWarning(
                     name, "integer_code_as_ordinal",
                     f"integer column with {n_unique} distinct values inferred as ordinal; "
@@ -263,8 +259,8 @@ def infer_column_type(
                             levels), warns
         return spec(ColumnType.NUMERIC, "numeric dtype"), warns
 
-    # object / string columns
-    values = values.astype(str) if not _all_instances(values, str) else values
+    # string columns
+    values = to_strings(values)
     temporal = _infer_string_temporal(values)
     if temporal is not None:
         return spec(temporal, "strings parseable as date/time"), warns
@@ -354,11 +350,12 @@ def _level_key(value: Any) -> Any:
     return ("str", str(value))
 
 
-def _check_override_against_data(column: str, spec: TypeSpec, series: pd.Series) -> TypeSpec:
-    values = _nonmissing(series)
+def _check_override_against_data(column: str, spec: TypeSpec, series: pl.Series) -> TypeSpec:
+    values = nonmissing(series)
     t = spec.type
+    dtype = series.dtype
     if t in CATEGORICAL_TYPES and len(values):
-        observed = values.unique().tolist()
+        observed = values.unique(maintain_order=True).to_list()
         if spec.levels is not None:
             allowed = {_level_key(v) for v in spec.levels}
             missing = [v for v in observed if _level_key(v) not in allowed]
@@ -368,21 +365,18 @@ def _check_override_against_data(column: str, spec: TypeSpec, series: pd.Series)
         elif t is ColumnType.BINARY and len(observed) > 2:
             raise TypeSpecError(f"[{column}] binary override but {len(observed)} distinct values")
         elif t is ColumnType.ORDINAL:
-            dtype = series.dtype
-            if isinstance(dtype, pd.CategoricalDtype) and dtype.ordered:
-                spec = replace(spec, levels=tuple(dtype.categories.tolist()))
-            elif pd.api.types.is_numeric_dtype(dtype) and not pd.api.types.is_bool_dtype(dtype):
+            if dtype.base_type() is pl.Enum:
+                spec = replace(spec, levels=tuple(dtype.categories.to_list()))
+            elif dtype.is_numeric():
                 spec = replace(spec, levels=tuple(sorted(observed)))
             else:
                 raise TypeSpecError(f"[{column}] ordinal override on non-numeric values needs "
                                     "explicit 'levels' (the order is never guessed)")
-    if t is ColumnType.NUMERIC and len(values):
-        if not pd.api.types.is_numeric_dtype(series.dtype) or pd.api.types.is_bool_dtype(
-            series.dtype
-        ):
-            converted = pd.to_numeric(values, errors="coerce")
-            if converted.isna().any():
-                raise TypeSpecError(f"[{column}] numeric override but values are not numeric")
+    if t is ColumnType.NUMERIC and len(values) and not dtype.is_numeric():
+        converted = to_strings(values).cast(pl.Float64, strict=False) \
+            if dtype != pl.Boolean else values.cast(pl.Float64)
+        if converted.null_count():
+            raise TypeSpecError(f"[{column}] numeric override but values are not numeric")
     return spec
 
 
@@ -399,19 +393,13 @@ def _normalize_pseudonymize(pseudonymize: Sequence[str] | None,
     return names
 
 
-def has_string_levels(series: pd.Series) -> bool:
+def has_string_levels(series: pl.Series) -> bool:
     """True unless the values are numbers or booleans (codes are never pseudonymized)."""
-    values = _nonmissing(series)
-    if pd.api.types.is_bool_dtype(series.dtype) or _all_instances(values, (bool, np.bool_)):
-        return False
-    if isinstance(series.dtype, pd.CategoricalDtype):
-        categories = series.dtype.categories
-        return not (pd.api.types.is_numeric_dtype(categories.dtype)
-                    or pd.api.types.is_bool_dtype(categories.dtype))
-    return not pd.api.types.is_numeric_dtype(series.dtype)
+    dtype = series.dtype
+    return not (dtype == pl.Boolean or dtype.is_numeric())
 
 
-def _apply_pseudonymize(name: str, spec: TypeSpec, series: pd.Series,
+def _apply_pseudonymize(name: str, spec: TypeSpec, series: pl.Series,
                         requested: bool) -> tuple[TypeSpec, list[TypeWarning]]:
     """Set ``spec.pseudonymize`` and collect warnings; the user makes the final call."""
     warns: list[TypeWarning] = []
@@ -427,11 +415,11 @@ def _apply_pseudonymize(name: str, spec: TypeSpec, series: pd.Series,
         return spec, warns
 
     if is_string_categorical:
-        values = _nonmissing(series)
+        values = nonmissing(series)
         reasons = []
         if sensitive_column_name(name):
             reasons.append("the column name matches an identifier/person/institution pattern")
-        if len(values) and values.nunique() / len(values) >= HIGH_CARDINALITY_RATIO:
+        if len(values) and values.n_unique() / len(values) >= HIGH_CARDINALITY_RATIO:
             reasons.append("almost every row has a distinct value")
         if reasons:
             warns.append(TypeWarning(
@@ -442,19 +430,8 @@ def _apply_pseudonymize(name: str, spec: TypeSpec, series: pd.Series,
     return spec, warns
 
 
-def _check_columns(df: pd.DataFrame) -> list[str]:
-    columns = list(df.columns)
-    bad = [c for c in columns if not isinstance(c, str)]
-    if bad:
-        raise TypeSpecError(f"column names must be strings; got {bad[:5]!r}")
-    dupes = sorted({c for c in columns if columns.count(c) > 1})
-    if dupes:
-        raise TypeSpecError(f"duplicate column names: {dupes}")
-    return columns
-
-
 def resolve_types(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     types: Mapping[str, Any] | None = None,
     *,
     pseudonymize: Sequence[str] | None = None,
@@ -469,7 +446,8 @@ def resolve_types(
     override sets ``"pseudonymize": True`` (the override wins over the list).
     String categoricals that look sensitive only produce a warning.
     """
-    columns = _check_columns(df)
+    df = prepare(df)
+    columns = check_columns(df)
     types = dict(types or {})
     unknown = set(types) - set(columns)
     if unknown:
@@ -496,7 +474,7 @@ def resolve_types(
 
 
 def infer_types(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     types: Mapping[str, Any] | None = None,
     *,
     pseudonymize: Sequence[str] | None = None,

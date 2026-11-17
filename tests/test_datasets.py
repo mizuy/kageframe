@@ -1,6 +1,7 @@
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from kageframe.datasets import (
     EXPECTED_EDGE_CASE_TYPES,
@@ -17,7 +18,7 @@ from kageframe.datasets import (
 def test_same_seed_is_reproducible():
     a = make_clinical_like_df(n=500, seed=3)
     b = make_clinical_like_df(n=500, seed=3)
-    pd.testing.assert_frame_equal(a, b)
+    assert_frame_equal(a, b)
 
 
 def test_different_seed_differs():
@@ -34,30 +35,30 @@ def test_columns_cover_every_type(clinical_df):
 
 def test_missing_rates_are_exact(clinical_df):
     for name, rate in MISSING_RATES.items():
-        assert clinical_df[name].isna().mean() == pytest.approx(rate, abs=1e-4), name
+        assert clinical_df[name].is_null().mean() == pytest.approx(rate, abs=1e-4), name
 
 
 def test_value_domains(clinical_df):
     df = clinical_df
     assert df["patient_id"].is_unique
-    assert set(df["sex"].dropna()) == {"M", "F"}
-    assert set(df["smoker"].dropna()) == {0, 1}
-    assert set(df["stage"].dropna()) == {"I", "II", "III", "IV"}
-    assert set(df["ecog"].dropna()) <= {0, 1, 2, 3, 4}
-    assert (df["crp"].dropna() == 0).mean() == pytest.approx(0.3, abs=0.03)
-    assert (df["bmi"].dropna() * 10 % 1 == 0).all()
-    assert (df["exam_date"].dropna().dt.hour == 0).all()
-    assert not (df["admit_dt"].dropna().dt.hour == 0).all()
-    assert df["visit_time"].dropna().str.fullmatch(r"\d{2}:\d{2}").all()
+    assert set(df["sex"].drop_nulls()) == {"M", "F"}
+    assert set(df["smoker"].drop_nulls()) == {0, 1}
+    assert set(df["stage"].drop_nulls()) == {"I", "II", "III", "IV"}
+    assert set(df["ecog"].drop_nulls()) <= {0, 1, 2, 3, 4}
+    assert (df["crp"].drop_nulls() == 0).mean() == pytest.approx(0.3, abs=0.03)
+    assert (df["bmi"].drop_nulls() * 10 % 1 == 0).all()
+    assert (df["exam_date"].drop_nulls().dt.hour() == 0).all()
+    assert not (df["admit_dt"].drop_nulls().dt.hour() == 0).all()
+    assert df["visit_time"].drop_nulls().str.contains(r"^\d{2}:\d{2}$").all()
     assert df["site"].eq("A").all()
-    assert df["unused"].isna().all()
+    assert df["unused"].is_null().all()
 
 
 def test_indication_frequencies_and_rare_levels(clinical_df):
-    counts = clinical_df["indication"].value_counts()
+    counts = dict(clinical_df["indication"].value_counts().iter_rows())
     for level, count in RARE_INDICATIONS.items():
         assert 0 < counts.get(level, 0) <= count
-    freqs = clinical_df["indication"].value_counts(normalize=True)
+    freqs = dict(clinical_df["indication"].value_counts(normalize=True).iter_rows())
     for level, p in zip(INDICATION_LEVELS, (0.20, 0.42, 0.15, 0.23), strict=True):
         assert freqs[level] == pytest.approx(p, abs=0.02)
 
@@ -74,7 +75,7 @@ def test_latent_correlation_is_valid():
 
 def test_latent_correlation_is_reflected_in_data():
     df = make_clinical_like_df(n=20000, seed=1, missing=False)
-    rho = df["age"].corr(df["ecog"].astype(float), method="spearman")
+    rho = df.select(pl.corr("age", "ecog", method="spearman")).item()
     assert rho > 0.2
 
 

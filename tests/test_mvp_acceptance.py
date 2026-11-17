@@ -16,8 +16,9 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from kageframe import compare, generate, load_profile, profile_dataframe
 from kageframe.datasets import RECOMMENDED_TYPES, make_clinical_like_df
@@ -29,7 +30,7 @@ CATEGORICAL = ["sex", "smoker", "stage", "ecog", "indication", "lab_flag"]
 
 
 @pytest.fixture(scope="module")
-def real() -> pd.DataFrame:
+def real() -> pl.DataFrame:
     return make_clinical_like_df(n=10000, seed=0)
 
 
@@ -41,7 +42,7 @@ def profile(real):
 
 
 @pytest.fixture(scope="module")
-def dummy(real, profile) -> pd.DataFrame:
+def dummy(real, profile) -> pl.DataFrame:
     return generate(profile, n=len(real), seed=SEED)
 
 
@@ -55,12 +56,12 @@ def test_1_same_columns(real, dummy) -> None:
     assert list(dummy.columns) == [c for c in real.columns if c not in FREE_TEXT]
     assert len(dummy) == len(real)
     for name in ("age", "bmi", "crp"):
-        assert pd.api.types.is_numeric_dtype(dummy[name])
+        assert dummy[name].dtype.is_numeric()
     for name in ("exam_date", "admit_dt"):
-        assert pd.api.types.is_datetime64_any_dtype(dummy[name])
-    assert dummy["visit_time"].dropna().str.fullmatch(r"\d{2}:\d{2}").all()
+        assert dummy[name].dtype.base_type() is pl.Datetime
+    assert dummy["visit_time"].drop_nulls().str.contains(r"^\d{2}:\d{2}$").all()
     # identifiers are regenerated and never reuse a real id
-    assert dummy["patient_id"].is_unique
+    assert dummy["patient_id"].is_unique().all()
     assert not set(dummy["patient_id"]) & set(real["patient_id"])
 
 
@@ -68,7 +69,7 @@ def test_1_same_columns(real, dummy) -> None:
 def test_2_marginals_roughly_match(report, name) -> None:
     """Numeric, date and time distributions: CDF distance on the profile grid <= 0.02;
     numeric mean within 0.05 SD and SD within 5% (IQR within 10% for heavy tails)."""
-    row = report.summary().loc[name]
+    row = report.summary().filter(column=name).row(0, named=True)
     assert row["grid_ks"] <= 0.02
     if name == "admit_dt":
         assert row["grid_ks_time"] <= 0.02
@@ -83,7 +84,7 @@ def test_2_marginals_roughly_match(report, name) -> None:
 @pytest.mark.parametrize("name", CATEGORICAL)
 def test_3_category_frequencies_roughly_match(report, name) -> None:
     """Per-level frequency difference <= 0.015, TVD <= 0.03, and no level outside the profile."""
-    row = report.summary().loc[name]
+    row = report.summary().filter(column=name).row(0, named=True)
     assert row["max_abs_dp"] <= 0.015
     assert row["tvd"] <= 0.03
     assert row["unseen_values"] == 0
@@ -93,11 +94,11 @@ def test_4_missing_rates_match(real, profile, dummy) -> None:
     """Exact mode reproduces every missing rate up to rounding; Bernoulli mode within 3 SE."""
     n = len(dummy)
     for name in dummy.columns:
-        assert abs(dummy[name].isna().mean() - real[name].isna().mean()) <= 1 / n, name
+        assert abs(dummy[name].is_null().mean() - real[name].is_null().mean()) <= 1 / n, name
     bern = generate(profile, n=n, seed=SEED, missing="bernoulli")
     for name in dummy.columns:
-        p = real[name].isna().mean()
-        assert abs(bern[name].isna().mean() - p) <= 3 * np.sqrt(p * (1 - p) / n) + 0.001, name
+        p = real[name].is_null().mean()
+        assert abs(bern[name].is_null().mean() - p) <= 3 * np.sqrt(p * (1 - p) / n) + 0.001, name
 
 
 def test_5_pairwise_dependence_roughly_matches(report) -> None:
@@ -105,7 +106,7 @@ def test_5_pairwise_dependence_roughly_matches(report) -> None:
     <= 0.03 between continuous dimensions, <= 0.05 with binary/ordinal, <= 0.07 with nominal
     levels, RMSE <= 0.02. (Recovery of the true correlation is tested in test_dependence.)"""
     table = report.correlation_table()
-    worst = table.groupby("kind")["abs_diff"].max()
+    worst = dict(table.group_by("kind").agg(pl.col("abs_diff").max()).iter_rows())
     assert worst["continuous"] <= 0.03
     assert worst["discrete"] <= 0.05
     assert worst["nominal"] <= 0.07
@@ -116,21 +117,21 @@ def test_6_nominal_has_exactly_one_level(profile, dummy) -> None:
     """Every observed row of a nominal column holds exactly one known level."""
     levels = profile.column("indication").levels
     values = dummy["indication"]
-    observed = values.notna()
-    assert set(values[observed]) <= set(levels)
-    one_hot = pd.get_dummies(values).reindex(columns=levels, fill_value=False)
-    row_sums = one_hot.sum(axis=1)
-    assert (row_sums[observed] == 1).all()
-    assert (row_sums[~observed] == 0).all()
+    observed = values.is_not_null()
+    assert set(values.filter(observed)) <= set(levels)
+    one_hot = pl.DataFrame({lv: values == lv for lv in levels}).fill_null(False)
+    row_sums = one_hot.sum_horizontal()
+    assert (row_sums.filter(observed) == 1).all()
+    assert (row_sums.filter(~observed) == 0).all()
 
 
 def test_7_seed_reproducibility(tmp_path, real, profile, dummy) -> None:
     """Same seed -> identical data (also after save/load); another seed -> different data;
     profiling the same DataFrame twice gives the identical JSON."""
-    pd.testing.assert_frame_equal(generate(profile, n=len(real), seed=SEED), dummy)
+    assert_frame_equal(generate(profile, n=len(real), seed=SEED), dummy)
     assert not generate(profile, n=len(real), seed=SEED + 1).equals(dummy)
     profile.save(tmp_path / "profile.json")
-    pd.testing.assert_frame_equal(
+    assert_frame_equal(
         generate(load_profile(tmp_path / "profile.json"), n=len(real), seed=SEED), dummy)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
