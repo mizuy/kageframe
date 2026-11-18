@@ -4,7 +4,7 @@
 
 `kageframe` は、手元の Polars DataFrame（主に臨床データ）を**要約統計だけの profile** に変換し、その profile から、列・型・周辺分布・欠測率・おおまかな変数間の依存が近い **dummy DataFrame** を生成するライブラリです。実データはローカルに残したまま、dummy data だけを使って解析コードを書く・レビューする・coding agent に渡す、という運用を想定しています。
 
-**状態: V0.2 開発中。** V0.2 で pandas から Polars に全面的に移りました（pandas には依存しません）。 `profile_dataframe` / `generate` / `compare` が使えます。numeric・binary・ordinal・nominal・date・datetime・time の全型と欠測（MCAR）に対応しています。リリースまでは API と profile JSON のスキーマ（`0.2.0`）が変わる可能性があります。`0.1.0`（pandas 版）の profile は読み込めないので、作り直してください。
+**状態: V0.2 開発中。** V0.2 で pandas から Polars に全面的に移りました（pandas には依存しません）。 `profile_dataframe` / `generate` / `compare` が使えます。numeric・binary・ordinal・nominal・date・datetime・time の全型と欠測（MCAR）に対応しています。リリースまでは API と profile JSON のスキーマ（`0.3.0`）が変わる可能性があります。`0.3.0` で相関の持ち方を変えたので、`0.2.0` 以前の profile は読み込めません。作り直してください。
 
 ## インストール
 
@@ -71,7 +71,7 @@ dtype は元の列に合わせます。`Int32` や `Float32` などの幅、`Dat
 - **周辺分布**: grid 上の CDF の差が 0.02 以下。平均の差が 0.05 SD 以下。SD の比の差が 5% 以下（裾の重い列は IQR で 10% 以下）。
 - **カテゴリ頻度**: level ごとの差が 0.015 以下、TVD が 0.03 以下。profile にない値がないこと。
 - **欠測率**: 二項分布の標準誤差の 3 倍以内。
-- **相関**: 連続量どうしは 0.03 以下、binary/ordinal を含むペアは 0.05 以下、nominal を含むペアは 0.07 以下。ただし推定量の標準誤差の 4 倍まではペアごとに許容する。全体の RMSE は 0.02 以下。
+- **相関**: profile に保存したペアだけを確かめる（保存していないペアは独立として生成するので確かめない）。連続量どうしは 0.03 以下、binary/ordinal を含むペアは 0.05 以下、nominal を含むペアは 0.07 以下。ただし推定量の標準誤差の 4 倍まではペアごとに許容する。全体の RMSE は 0.02 以下。
 
 周辺分布の許容誤差は dummy が 10,000 行の場合の値で、行数 n が少ないと `sqrt(10000 / n)` 倍に広がります。
 
@@ -126,9 +126,28 @@ kageframe.compare(profile, dummy_real, level_map="level_map.local.json").check()
   - 値のほぼすべて（90% 以上）が行ごとに異なる。
 - 対応表は profile JSON には入りません。`*.local.json` は `.gitignore` 済みです。
 
+## 相関の持ち方
+
+profile を小さく保つため、相関はすべての組み合わせではなく、相関がある程度ある列ペアだけを保存します。
+
+- 列ペアの latent 相関と観測相関のどちらも絶対値が `correlation_threshold`（既定 0.1）未満なら保存せず、その 2 列は独立として生成します。nominal は level ごとの相関のどれかが閾値に届けば、その列ペアの全 level を保存します。
+- 値は `correlation_decimals`（既定 3）桁に丸めます。
+- 解析に使わない列は `independent=[...]` に指定すると、周辺分布だけを残し、ほかの列との相関を持ちません。
+- 閾値で落とした結果、相関行列が正定値でなくなることがあります。その場合は生成時に最も近い正定値行列に直します（profile の `psd_correction` に、どれだけ直したかが記録されます）。
+
+```python
+profile = kageframe.profile_dataframe(
+    df,
+    independent=["memo_flag", "lab_unused"],   # 相関を持たない列
+    correlation_threshold=0.1,                  # 既定値
+)
+```
+
+保存形式は `"pairs": [[i, j, latent, observed], ...]` で、`i`, `j` は latent 次元（nominal は level ごと、datetime は日付と時刻の 2 つ）の番号です。238 列（nominal を開いて 504 次元）の模擬データで、`0.2.0` の 21.8 MB が約 0.6 MB になりました。
+
 ## profile に入るもの・入らないもの
 
-profile は、列ごとの集計値と相関行列だけを持つ JSON です。持ち出す前に中身を確認してください（普通のテキストファイルです）。
+profile は、列ごとの集計値と、相関のあるペアの相関係数だけを持つ JSON です。持ち出す前に中身を確認してください（普通のテキストファイルです）。
 
 **入るもの**
 
@@ -137,7 +156,7 @@ profile は、列ごとの集計値と相関行列だけを持つ JSON です。
 - binary / ordinal / nominal: level 名（または仮名）と件数。
 - date / datetime / time: 日数・秒数の quantile grid、時刻の分解能、タイムゾーン名、文字列の書式。
 - 列の値が 1 種類だけの場合、その値。
-- 変数間の latent 相関行列、ペアごとの同時観測数、profile 中に出た警告。
+- 相関がある程度ある列ペアの latent 相関と観測相関（小数 3 桁）、profile 中に出た警告。
 
 **入らないもの**
 
@@ -152,7 +171,7 @@ profile は匿名化を保証するものではありません。level 名、件
 
 ## 仕組みと既知の制限
 
-- 依存構造は Gaussian copula で表します。各列を正規スコアに変換し、latent 相関を推定します。binary/ordinal の組み合わせは Mehler 展開を逆算して補正します。nominal は Gumbel-max で生成するので、level の頻度は正確に再現されます。
+- 依存構造は Gaussian copula で表します。閾値未満のペアは独立とみなすので、弱い相関は再現しません。各列を正規スコアに変換し、latent 相関を推定します。binary/ordinal の組み合わせは Mehler 展開を逆算して補正します。nominal は Gumbel-max で生成するので、level の頻度は正確に再現されます。
 - datetime は日付部分と時刻部分に分けて扱います。曜日×時刻のような非単調な依存は再現しません。
 - タイムゾーン付きの `Datetime` は、その地域の壁時計の時刻で profile します。生成時に存在しない時刻（夏時間の切り替え）は null になります。UTC オフセット付きの文字列（`+09:00`、`Z`）は UTC に直して扱い、タイムゾーンは `UTC` になります。
 - 日付の文字列は `YYYY-MM-DD`（区切りは `-` `/` `.`）、時刻は `H:MM[:SS]` の形だけを認識します。

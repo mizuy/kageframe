@@ -23,7 +23,7 @@ from kageframe.schema import LatentLabel
 
 def _latent(profile) -> tuple[list[str], np.ndarray]:
     labels = [lb.key for lb in profile.latent_labels()]
-    return labels, np.array(profile.dependence.latent.matrix, dtype=float)
+    return labels, profile.dependence.latent_matrix()
 
 
 def test_interval_scores() -> None:
@@ -93,9 +93,6 @@ def test_pairwise_missing_uses_joint_rows() -> None:
     p = profile_dataframe(df, types=MIXED_TYPES)
     labels, m = _latent(p)
     assert np.max(np.abs(m[np.triu_indices(4, 1)] - 0.5)) < 0.04
-    i, j = labels.index("x"), labels.index("o")
-    expected = int((df["x"].is_not_null() & df["o"].is_not_null()).sum())
-    assert p.dependence.observed.n_pairs[i][j] == expected
 
 
 def test_sparse_pairs_set_to_zero_and_warn() -> None:
@@ -107,7 +104,7 @@ def test_sparse_pairs_set_to_zero_and_warn() -> None:
     df = pl.DataFrame({"a": a, "b": b})
     with pytest.warns(KageFrameWarning, match="jointly observed"):
         p = profile_dataframe(df)
-    assert p.dependence.latent.matrix[0][1] == 0.0
+    assert p.dependence.latent_matrix()[0, 1] == 0.0
     assert any(w.code == "sparse_pairs" for w in p.warnings)
 
 
@@ -156,7 +153,15 @@ def test_fixture_latent_correlation_recovered(clinical_profile) -> None:
     t = truth[np.ix_(idx, idx)]
     nominal = np.array(["[" in lb for lb in labels])
     plain = ~nominal
-    assert np.max(np.abs(m[np.ix_(plain, plain)] - t[np.ix_(plain, plain)])) < 0.06
+    stored = np.eye(len(labels), dtype=bool)
+    for i, j, _, _ in clinical_profile.dependence.pairs:
+        stored[i, j] = stored[j, i] = True
+    pp = np.ix_(plain, plain)
+    diff = np.abs(m[pp] - t[pp])
+    assert np.max(diff[stored[pp]]) < 0.06
+    # Unstored pairs are below the threshold (generated as independent).
+    threshold = clinical_profile.options["correlation_threshold"]
+    assert np.max(np.abs(t[pp][~stored[pp]]), initial=0.0) < threshold + 0.03
     # Nominal score correlations are identified only through B r (B has a null space).
     probs = np.array(clinical_profile.column("indication").probabilities)
     b = nominal_b_matrix(probs)
@@ -178,3 +183,34 @@ def test_no_latent_columns() -> None:
         warnings.simplefilter("ignore")
         p = profile_dataframe(pl.DataFrame({"id": [f"P{i:05d}" for i in range(200)]}))
     assert p.latent_labels() == []
+
+
+def _three_columns(n: int = 5000) -> pl.DataFrame:
+    rng = np.random.default_rng(3)
+    z = rng.normal(size=(n, 3))
+    return pl.DataFrame({"a": z[:, 0], "b": 0.6 * z[:, 0] + 0.8 * z[:, 1],
+                         "c": 0.05 * z[:, 0] + z[:, 2]})
+
+
+def test_weak_pairs_are_not_stored_and_values_are_rounded() -> None:
+    p = profile_dataframe(_three_columns())
+    keys = [lb.key for lb in p.latent_labels()]
+    stored = {(keys[i], keys[j]) for i, j, _, _ in p.dependence.pairs}
+    assert stored == {("a", "b")}
+    _, _, lat, obs = p.dependence.pairs[0]
+    assert lat == round(lat, 3) and obs == round(obs, 3)
+    assert lat == pytest.approx(0.6, abs=0.03)
+
+
+def test_threshold_zero_keeps_every_pair() -> None:
+    p = profile_dataframe(_three_columns(), correlation_threshold=0.0)
+    assert len(p.dependence.pairs) == 3
+
+
+def test_independent_columns_have_no_pairs() -> None:
+    p = profile_dataframe(_three_columns(), independent=["b"])
+    assert p.dependence.pairs == []
+    assert p.dependence.independent == ["b"]
+    assert p.column("b").mean == pytest.approx(0.0, abs=0.05)
+    with pytest.raises(ValueError, match="not in df"):
+        profile_dataframe(_three_columns(), independent=["zzz"])

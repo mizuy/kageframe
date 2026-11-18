@@ -61,7 +61,8 @@ def pairwise_latent_correlation(
     return corr, n_pairs.astype(np.int64), off_diag_sparse
 
 
-def _groups(labels: Sequence[LatentLabel]) -> list[list[int]]:
+def latent_groups(labels: Sequence[LatentLabel]) -> list[list[int]]:
+    """Indices of each nominal column's block, and of every other dimension on its own."""
     blocks = nominal_blocks(list(labels))
     groups: dict[int, list[int]] = {}
     for i, b in enumerate(blocks):
@@ -83,7 +84,7 @@ def observed_to_latent(
     """
     d = observed.shape[0]
     latent = np.eye(d)
-    groups = _groups(labels)
+    groups = latent_groups(labels)
     transforms: list[np.ndarray] = []
     for idx in groups:
         label = labels[idx[0]]

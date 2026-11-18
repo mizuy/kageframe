@@ -1,4 +1,4 @@
-"""Profile JSON schema (version 0.1.0): dataclasses, validation, save/load.
+"""Profile JSON schema (version 0.3.0): dataclasses, validation, save/load.
 
 A profile contains aggregate statistics only. The pseudonym-to-real-name level map
 is held in memory (``Profile.level_map``) and is never written by ``Profile.save``;
@@ -19,7 +19,7 @@ from ._version import __version__
 from .exceptions import KageFrameWarning, ProfileSchemaError
 from .types import CATEGORICAL_TYPES, LATENT_TYPES, ColumnType
 
-SCHEMA_VERSION = "0.2.0"
+SCHEMA_VERSION = "0.3.0"
 LEVEL_MAP_KIND = "kageframe_level_map"
 LEVEL_MAP_WARNING = "LOCAL ONLY - DO NOT SHARE. Maps pseudonymized level names to real values."
 DATE_REFERENCE = "1970-01-01"
@@ -32,6 +32,8 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "max_levels": 50,
     "ordinal_max_levels": 10,
     "min_pair_count": 30,
+    "correlation_threshold": 0.1,
+    "correlation_decimals": 3,
     "datetime_mode": "split",
     "correlation_estimator": "interval_scores_mehler",
 }
@@ -633,85 +635,100 @@ def latent_labels(columns: Sequence[ColumnProfile]) -> list[LatentLabel]:
     return labels
 
 
-def _square_matrix(m: Any, d: int, path: str, *, allow_null: bool,
-                   integer: bool = False) -> list[list[Any]]:
-    if not isinstance(m, list) or len(m) != d:
-        raise _err(path, f"expected a {d}x{d} matrix")
-    for i, row in enumerate(m):
-        if not isinstance(row, list) or len(row) != d:
-            raise _err(f"{path}[{i}]", f"expected a row of length {d}")
-        for j, v in enumerate(row):
-            if v is None and allow_null:
-                continue
-            if integer:
-                _integer(v, f"{path}[{i}][{j}]")
-            else:
-                _number(v, f"{path}[{i}][{j}]", lo=-1, hi=1)
-    for i in range(d):
-        for j in range(i + 1, d):
-            if m[i][j] != m[j][i]:
-                raise _err(path, f"matrix must be symmetric (entry [{i}][{j}])")
-    return m
-
-
-@dataclass
-class CorrelationMatrix:
-    labels: list[LatentLabel]
-    matrix: list[list[float | None]]
-    n_pairs: list[list[int]] | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"labels": [lb.to_dict() for lb in self.labels],
-                             "matrix": [list(r) for r in self.matrix]}
-        if self.n_pairs is not None:
-            d["n_pairs"] = [list(r) for r in self.n_pairs]
-        return d
-
-
 @dataclass
 class Dependence:
-    """``observed``: one-hot feature space (compare target); ``latent``: generation space."""
+    """Sparse latent correlations: only column pairs that are clearly correlated.
 
-    observed: CorrelationMatrix
-    latent: CorrelationMatrix
+    ``pairs`` holds ``(i, j, latent, observed)`` with ``i < j`` indexing ``labels``
+    (the latent dimensions implied by the columns). ``latent`` is the generation-space
+    correlation; ``observed`` is the one-hot feature correlation that :func:`compare`
+    checks. Pairs that are not listed are independent (latent correlation 0). Columns in
+    ``independent`` were excluded from dependence estimation on purpose.
+    """
+
+    labels: list[LatentLabel]
+    pairs: list[tuple[int, int, float, float]] = field(default_factory=list)
+    independent: list[str] = field(default_factory=list)
     method: str = "latent_gaussian_copula"
     psd_correction: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def dim(self) -> int:
+        return len(self.labels)
+
+    def latent_matrix(self) -> Any:
+        """Dense generation-space correlation matrix (numpy), 0 for unlisted pairs."""
+        import numpy as np
+
+        m = np.eye(self.dim)
+        for i, j, lat, _ in self.pairs:
+            m[i, j] = m[j, i] = lat
+        return m
+
+    def observed_matrix(self) -> Any:
+        """Dense observed-feature correlation matrix (numpy), NaN for unlisted pairs."""
+        import numpy as np
+
+        m = np.full((self.dim, self.dim), np.nan)
+        np.fill_diagonal(m, 1.0)
+        for i, j, _, obs in self.pairs:
+            m[i, j] = m[j, i] = obs
+        return m
+
     def to_dict(self) -> dict[str, Any]:
-        return {"method": self.method, "observed": self.observed.to_dict(),
-                "latent": self.latent.to_dict(), "psd_correction": dict(self.psd_correction)}
+        return {"method": self.method, "dim": self.dim, "independent": list(self.independent),
+                "pairs": [[i, j, lat, obs] for i, j, lat, obs in self.pairs],
+                "psd_correction": dict(self.psd_correction)}
 
     @classmethod
     def from_dict(cls, d: Any, path: str, expected: list[LatentLabel]) -> Dependence:
         d = _require_mapping(d, path)
-        _check_keys(d, path, {"method", "observed", "latent", "psd_correction"}, set())
+        if "latent" in d or "observed" in d:
+            raise _err(path, "dense correlation matrices are the schema 0.2 format; "
+                             "re-create the profile with this kageframe version")
+        _check_keys(d, path, {"method", "dim", "independent", "pairs", "psd_correction"},
+                    set())
         _string(d["method"], f"{path}.method", choices=("latent_gaussian_copula",))
-        dim = len(expected)
+        dim = _integer(d["dim"], f"{path}.dim")
+        if dim != len(expected):
+            raise _err(f"{path}.dim", f"expected {len(expected)} latent dimensions implied "
+                                      f"by columns, got {dim}")
+        if not isinstance(d["independent"], list):
+            raise _err(f"{path}.independent", "expected a list")
+        latent_columns = {lb.column for lb in expected}
+        independent = []
+        for k, c in enumerate(d["independent"]):
+            c = _string(c, f"{path}.independent[{k}]")
+            if c not in latent_columns:
+                raise _err(f"{path}.independent[{k}]",
+                           f"{c!r} is not a column with a latent dimension")
+            independent.append(c)
+        ind = set(independent)
         blocks = nominal_blocks(expected)
-        parsed = {}
-        for part in ("observed", "latent"):
-            p = f"{path}.{part}"
-            m = _require_mapping(d[part], p)
-            _check_keys(m, p, {"labels", "matrix"}, {"n_pairs"} if part == "observed" else set())
-            if not isinstance(m["labels"], list):
-                raise _err(f"{p}.labels", "expected a list")
-            labels = [LatentLabel.from_dict(x, f"{p}.labels[{i}]")
-                      for i, x in enumerate(m["labels"])]
-            if labels != expected:
-                raise _err(f"{p}.labels", "labels do not match the latent dimensions implied "
-                                          "by columns")
-            matrix = _square_matrix(m["matrix"], dim, f"{p}.matrix",
-                                    allow_null=part == "observed")
-            n_pairs = None
-            if part == "observed":
-                if "n_pairs" not in m:
-                    raise _err(p, "missing required fields ['n_pairs']")
-                n_pairs = _square_matrix(m["n_pairs"], dim, f"{p}.n_pairs", allow_null=False,
-                                         integer=True)
-            _check_blocks(matrix, blocks, dim, p, latent=part == "latent")
-            parsed[part] = CorrelationMatrix(labels, matrix, n_pairs)
+        if not isinstance(d["pairs"], list):
+            raise _err(f"{path}.pairs", "expected a list")
+        pairs: list[tuple[int, int, float, float]] = []
+        prev = (-1, -1)
+        for k, row in enumerate(d["pairs"]):
+            p = f"{path}.pairs[{k}]"
+            if not isinstance(row, list) or len(row) != 4:
+                raise _err(p, "expected [i, j, latent, observed]")
+            i, j = _integer(row[0], f"{p}[0]"), _integer(row[1], f"{p}[1]")
+            if not i < j < dim:
+                raise _err(p, f"indices must satisfy i < j < {dim}")
+            if (i, j) <= prev:
+                raise _err(p, "pairs must be sorted by (i, j) without duplicates")
+            prev = (i, j)
+            if blocks[i] == blocks[j]:
+                raise _err(p, "latent scores of the same nominal column must be uncorrelated")
+            a, b = expected[i].column, expected[j].column
+            if a != b and (a in ind or b in ind):
+                raise _err(p, "pair involves an independent column")
+            lat = _number(row[2], f"{p}[2]", lo=-1, hi=1)
+            obs = _number(row[3], f"{p}[3]", lo=-1, hi=1)
+            pairs.append((i, j, lat, obs))
         psd = _require_mapping(d["psd_correction"], f"{path}.psd_correction")
-        return cls(parsed["observed"], parsed["latent"], d["method"], dict(psd))
+        return cls(list(expected), pairs, independent, d["method"], dict(psd))
 
 
 def nominal_blocks(labels: list[LatentLabel]) -> list[int]:
@@ -724,24 +741,6 @@ def nominal_blocks(labels: list[LatentLabel]) -> list[int]:
         else:
             ids.append(i)
     return ids
-
-
-def _check_blocks(m: list[list[Any]], blocks: list[int], d: int, path: str, *,
-                  latent: bool) -> None:
-    for i in range(d):
-        if m[i][i] is None or abs(m[i][i] - 1) > 1e-9:
-            raise _err(f"{path}.matrix[{i}][{i}]", "diagonal entries must be 1")
-        for j in range(d):
-            if i == j:
-                continue
-            same = blocks[i] == blocks[j]
-            v = m[i][j]
-            if latent and same and abs(v) > 1e-9:
-                raise _err(f"{path}.matrix[{i}][{j}]",
-                           "latent scores of the same nominal column must be uncorrelated")
-            if not latent and v is None and not same:
-                raise _err(f"{path}.matrix[{i}][{j}]",
-                           "null is only allowed within a nominal column's block")
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +820,8 @@ def _check_options(d: Any) -> dict[str, Any]:
             _boolean(v, f"options.{k}")
         elif isinstance(default, int):
             _integer(v, f"options.{k}", lo=1)
+        elif isinstance(default, float):
+            _number(v, f"options.{k}", lo=0, hi=1)
         else:
             _string(v, f"options.{k}")
         out[k] = v
@@ -831,9 +832,33 @@ def _reject_constant(token: str) -> Any:
     raise ProfileSchemaError(f"non-finite number {token} is not allowed in kageframe JSON")
 
 
+def _inline(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, allow_nan=False, separators=(", ", ": "))
+
+
+def _is_flat_list(v: Any) -> bool:
+    return isinstance(v, list) and all(not isinstance(x, (list, dict)) for x in v)
+
+
+def _format(obj: Any, level: int) -> str:
+    """Indented JSON, but lists of scalars stay on one line (one pair/row per line)."""
+    pad, inner = "  " * level, "  " * (level + 1)
+    if isinstance(obj, dict):
+        if not obj:
+            return "{}"
+        items = [f"{inner}{_inline(str(k))}: {_format(v, level + 1)}" for k, v in obj.items()]
+        return "{\n" + ",\n".join(items) + "\n" + pad + "}"
+    if isinstance(obj, list):
+        if _is_flat_list(obj):
+            return _inline(obj)
+        items = [f"{inner}{_format(v, level + 1)}" for v in obj]
+        return "[\n" + ",\n".join(items) + "\n" + pad + "]"
+    return _inline(obj)
+
+
 def _dumps(obj: Any) -> str:
     try:
-        return json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+        return _format(obj, 0) + "\n"
     except ValueError as e:
         raise ProfileSchemaError(f"cannot serialize: {e}") from None
 
@@ -909,6 +934,9 @@ class Profile:
                 raise _err(f"columns[{i}].n_nonmissing", "exceeds n_rows")
             column_from_dict(col.to_dict(), f"columns[{i}]")
         if self.dependence is not None:
+            if self.dependence.labels != self.latent_labels():
+                raise _err("dependence", "labels do not match the latent dimensions implied "
+                                         "by columns")
             Dependence.from_dict(self.dependence.to_dict(), "dependence", self.latent_labels())
         if self.level_map is not None:
             for c, mapping in self.level_map.columns.items():

@@ -11,7 +11,12 @@ import numpy as np
 import polars as pl
 
 from ._frame import dtype_name, prepare
-from .dependence import nominal_fixed_mask, observed_to_latent, pairwise_latent_correlation
+from .dependence import (
+    latent_groups,
+    nominal_fixed_mask,
+    observed_to_latent,
+    pairwise_latent_correlation,
+)
 from .exceptions import KageFrameWarning, PrivacyWarning
 from .marginals import ColumnResult
 from .marginals.categorical import profile_categorical
@@ -22,7 +27,6 @@ from .schema import (
     DEFAULT_OPTIONS,
     CategoricalColumn,
     ConstantColumn,
-    CorrelationMatrix,
     Dependence,
     IdColumn,
     LevelMap,
@@ -98,19 +102,37 @@ def _profile_column(name: str, series: pl.Series, spec: TypeSpec, n_rows: int,
     return profile_categorical(name, series, spec, n_rows=n_rows, options=options)
 
 
-def _matrix_to_list(m: np.ndarray) -> list[list[float | None]]:
-    d = m.shape[0]
-    out: list[list[float | None]] = [[None] * d for _ in range(d)]
-    for i in range(d):
-        for j in range(i, d):
-            v = m[i, j]
-            value = None if np.isnan(v) else float(np.clip(v, -1.0, 1.0))
-            out[i][j] = out[j][i] = value
-    return out
+def _sparse_pairs(observed: np.ndarray, raw_latent: np.ndarray, n_pairs: np.ndarray,
+                  labels: list, options: dict[str, Any], independent: set[str]
+                  ) -> list[tuple[int, int, float, float]]:
+    """Keep column-pair blocks whose |correlation| reaches the threshold (rounded)."""
+    threshold = options["correlation_threshold"]
+    decimals = options["correlation_decimals"]
+    groups = latent_groups(labels)
+    pairs: list[tuple[int, int, float, float]] = []
+    for gi, idx_i in enumerate(groups):
+        ci = labels[idx_i[0]].column
+        for idx_j in groups[gi + 1:]:
+            cj = labels[idx_j[0]].column
+            if ci != cj and (ci in independent or cj in independent):
+                continue
+            ix = np.ix_(idx_i, idx_j)
+            if (n_pairs[ix] < options["min_pair_count"]).any():
+                continue
+            obs = np.round(np.nan_to_num(observed[ix]), decimals)
+            lat = np.round(np.clip(raw_latent[ix], -1.0, 1.0), decimals)
+            if max(np.abs(obs).max(), np.abs(lat).max()) < threshold or \
+                    (not obs.any() and not lat.any()):
+                continue
+            for a, i in enumerate(idx_i):
+                for b, j in enumerate(idx_j):
+                    pairs.append((i, j, float(lat[a, b]) + 0.0, float(obs[a, b]) + 0.0))
+    pairs.sort(key=lambda p: (p[0], p[1]))
+    return pairs
 
 
 def _estimate_dependence(results: list[ColumnResult], n_rows: int, options: dict[str, Any],
-                         warns: list[WarningRecord]) -> Dependence:
+                         independent: set[str], warns: list[WarningRecord]) -> Dependence:
     columns = [r.column for r in results]
     labels = latent_labels(columns)
     features = [f for r in results if r.column.has_latent for f in r.features]
@@ -129,17 +151,18 @@ def _estimate_dependence(results: list[ColumnResult], n_rows: int, options: dict
     nominal_p = {c.name: np.array(c.probabilities) for c in columns
                  if isinstance(c, CategoricalColumn) and c.type is ColumnType.NOMINAL}
     raw_latent = observed_to_latent(np.nan_to_num(observed, nan=0.0), labels, nominal_p)
-    latent, info = nearest_correlation(raw_latent, nominal_fixed_mask(labels))
+    pairs = _sparse_pairs(observed, raw_latent, n_pairs, labels, options, independent)
+    dependence = Dependence(labels, pairs, sorted(independent))
+    # The stored (thresholded, rounded) matrix may not be positive definite; generate()
+    # applies the same correction. Record it here so it is visible in the profile.
+    _, info = nearest_correlation(dependence.latent_matrix(), nominal_fixed_mask(labels))
     if info["applied"] and info["max_abs_change"] > LARGE_PSD_CHANGE:
         warns.append(WarningRecord(None, "large_psd_correction",
                                    f"nearest-PSD correction changed a latent correlation by "
                                    f"{info['max_abs_change']:.3f}."))
-    return Dependence(
-        observed=CorrelationMatrix(labels, _matrix_to_list(observed),
-                                   [[int(v) for v in row] for row in n_pairs]),
-        latent=CorrelationMatrix(labels, _matrix_to_list(latent)),
-        psd_correction=info,
-    )
+    dependence.psd_correction = {k: (round(v, 6) if isinstance(v, float) else v)
+                                 for k, v in info.items()}
+    return dependence
 
 
 def profile_dataframe(
@@ -154,6 +177,9 @@ def profile_dataframe(
     max_levels: int = DEFAULT_OPTIONS["max_levels"],
     ordinal_max_levels: int = DEFAULT_OPTIONS["ordinal_max_levels"],
     min_pair_count: int = DEFAULT_OPTIONS["min_pair_count"],
+    independent: Sequence[str] | None = None,
+    correlation_threshold: float = DEFAULT_OPTIONS["correlation_threshold"],
+    correlation_decimals: int = DEFAULT_OPTIONS["correlation_decimals"],
 ) -> Profile:
     """Profile ``df`` into aggregate statistics (no row-level data).
 
@@ -186,6 +212,15 @@ def profile_dataframe(
         Type-inference limits for string categories and integer codes.
     min_pair_count:
         Pairs of columns observed together in fewer rows get correlation 0 (warning).
+    independent:
+        Columns treated as independent of all others: their marginals are profiled but
+        no correlation with other columns is stored. Use it for columns the analysis
+        will not use.
+    correlation_threshold:
+        Column pairs whose latent and observed correlations are all below this in
+        absolute value are not stored and are generated as independent.
+    correlation_decimals:
+        Stored correlations are rounded to this many decimals.
 
     Returns
     -------
@@ -201,7 +236,17 @@ def profile_dataframe(
     options.update(rare_threshold=rare_threshold, min_tail_count=min_tail_count,
                    quantile_grid=quantile_grid, discrete_max_levels=discrete_max_levels,
                    max_levels=max_levels, ordinal_max_levels=ordinal_max_levels,
-                   min_pair_count=min_pair_count)
+                   min_pair_count=min_pair_count,
+                   correlation_threshold=float(correlation_threshold),
+                   correlation_decimals=correlation_decimals)
+    if not 0.0 <= options["correlation_threshold"] <= 1.0:
+        raise ValueError("correlation_threshold must be in [0, 1]")
+    if options["correlation_decimals"] < 1:
+        raise ValueError("correlation_decimals is too small")
+    independent_set = set(independent or [])
+    unknown = sorted(independent_set - set(df.columns))
+    if unknown:
+        raise ValueError(f"independent columns not in df: {unknown}")
     for key in ("rare_threshold", "min_tail_count", "quantile_grid", "min_pair_count"):
         if options[key] < (2 if key == "quantile_grid" else 1):
             raise ValueError(f"{key} is too small")
@@ -224,7 +269,9 @@ def profile_dataframe(
         results.append(result)
 
     dependence_warnings: list[WarningRecord] = []
-    dependence = _estimate_dependence(results, n_rows, options, dependence_warnings)
+    latent_columns = {lb.column for lb in latent_labels([r.column for r in results])}
+    dependence = _estimate_dependence(results, n_rows, options,
+                                      independent_set & latent_columns, dependence_warnings)
     for w in dependence_warnings:
         warnings.warn(w.message, KageFrameWarning, stacklevel=2)
     records.extend(dependence_warnings)

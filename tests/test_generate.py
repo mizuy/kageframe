@@ -146,9 +146,12 @@ def test_non_positive_definite_matrix_falls_back(clinical_profile) -> None:
     d = clinical_profile.to_dict()
     labels = [lb.key for lb in clinical_profile.latent_labels()]
     i, j, k = labels.index("age"), labels.index("bmi"), labels.index("crp")
-    m = d["dependence"]["latent"]["matrix"]
+    pairs = {(p[0], p[1]): p for p in d["dependence"]["pairs"]}
     for a, b, v in ((i, j, 0.95), (i, k, 0.95), (j, k, -0.95)):
-        m[a][b] = m[b][a] = v
+        a, b = sorted((a, b))
+        pairs[(a, b)] = [a, b, v, v]
+    d["dependence"]["pairs"] = [pairs[key] for key in sorted(pairs)]
+    d["dependence"]["psd_correction"]["applied"] = False
     broken = Profile.from_dict(d)
     with pytest.warns(KageFrameWarning, match="not positive definite"):
         out = generate(broken, n=500, seed=0)
@@ -161,8 +164,8 @@ def test_generated_correlation_roundtrip(clinical_profile) -> None:
     labels = clinical_profile.latent_labels()
     assert again.latent_labels() == labels
     plain = np.array([lb.level is None for lb in labels])
-    a = np.array(clinical_profile.dependence.latent.matrix, dtype=float)[np.ix_(plain, plain)]
-    b = np.array(again.dependence.latent.matrix, dtype=float)[np.ix_(plain, plain)]
+    a = clinical_profile.dependence.latent_matrix()[np.ix_(plain, plain)]
+    b = again.dependence.latent_matrix()[np.ix_(plain, plain)]
     assert np.max(np.abs(a - b)) < 0.07
 
 

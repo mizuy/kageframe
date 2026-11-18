@@ -10,7 +10,6 @@ from kageframe.datasets import RECOMMENDED_TYPES, make_clinical_like_df
 from kageframe.schema import (
     CategoricalColumn,
     ConstantColumn,
-    CorrelationMatrix,
     DateColumn,
     DatetimeColumn,
     Dependence,
@@ -91,25 +90,15 @@ def build_example_columns() -> list:
 
 def build_example_dependence(columns: list) -> Dependence:
     labels = latent_labels(columns)
-    d = len(labels)
     keys = [lb.key for lb in labels]
-    latent = [[1.0 if i == j else 0.0 for j in range(d)] for i in range(d)]
-    observed = [[1.0 if i == j else 0.0 for j in range(d)] for i in range(d)]
-    ind = [keys.index(k) for k in ("indication[L01]", "indication[L02]", "indication[Other]")]
-    for i in ind:
-        for j in ind:
-            if i != j:
-                observed[i][j] = None
     pairs = [("age", "ecog", 0.35), ("age", "indication[L01]", 0.2),
              ("admit_dt::date", "admit_dt::time", 0.1), ("sex", "pain_score", -0.15)]
+    stored = []
     for a, b, r in pairs:
-        i, j = keys.index(a), keys.index(b)
-        latent[i][j] = latent[j][i] = r
-        observed[i][j] = observed[j][i] = r
-    n_pairs = [[900] * d for _ in range(d)]
+        i, j = sorted((keys.index(a), keys.index(b)))
+        stored.append((i, j, r, r))
     return Dependence(
-        observed=CorrelationMatrix(labels, observed, n_pairs),
-        latent=CorrelationMatrix(labels, latent),
+        labels, sorted(stored),
         psd_correction={"applied": False, "min_eigenvalue_before": 0.61,
                         "frobenius_change": 0.0, "iterations": 0},
     )
