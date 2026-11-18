@@ -49,12 +49,14 @@ def _latent_factor(profile: Profile) -> np.ndarray:
     labels = profile.latent_labels()
     if not labels:
         return np.zeros((0, 0))
-    r = np.array(profile.dependence.latent.matrix, dtype=float)
+    r = profile.dependence.latent_matrix()
     try:
         return np.linalg.cholesky(r)
     except np.linalg.LinAlgError:
-        warnings.warn("latent correlation matrix is not positive definite; applying the "
-                      "nearest-PSD correction before sampling", KageFrameWarning, stacklevel=3)
+        if not profile.dependence.psd_correction.get("applied"):
+            warnings.warn("latent correlation matrix is not positive definite; applying the "
+                          "nearest-PSD correction before sampling", KageFrameWarning,
+                          stacklevel=3)
         fixed, _ = nearest_correlation(r, nominal_fixed_mask(labels), eps=EIG_FLOOR)
         return np.linalg.cholesky(fixed)
 

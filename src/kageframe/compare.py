@@ -437,40 +437,55 @@ def _efficiencies(profile: Profile) -> list[float]:
     return out
 
 
-def _correlations(profile: Profile, dummy_profile: Profile) -> list[dict[str, Any]]:
+def _joint_counts(frame: pl.DataFrame, columns: list[str]) -> np.ndarray:
+    """Rows where both columns are observed, for every pair of ``columns``."""
+    present = [c for c in columns if c in frame.columns]
+    m = np.column_stack([frame[c].is_not_null().to_numpy() for c in present]).astype(float) \
+        if present else np.zeros((frame.height, 0))
+    counts = m.T @ m
+    index = {c: k for k, c in enumerate(present)}
+    out = np.zeros((len(columns), len(columns)))
+    for a, ca in enumerate(columns):
+        for b, cb in enumerate(columns):
+            if ca in index and cb in index:
+                out[a, b] = counts[index[ca], index[cb]]
+    return out
+
+
+def _correlations(profile: Profile, dummy_profile: Profile,
+                  dummy_frame: pl.DataFrame) -> list[dict[str, Any]]:
+    """Compare the pairs stored in the profile; unlisted (independent) pairs are skipped."""
     labels = profile.latent_labels()
     eff = _efficiencies(profile)
     dep = profile.dependence
-    d_labels = {lb.key: i for i, lb in enumerate(dummy_profile.latent_labels())}
-    d_dep = dummy_profile.dependence
+    d_labels = dummy_profile.latent_labels()
+    d_pairs = {(d_labels[i].key, d_labels[j].key): (lat, obs)
+               for i, j, lat, obs in dummy_profile.dependence.pairs}
+    columns = sorted({lb.column for lb in labels})
+    col_index = {c: k for k, c in enumerate(columns)}
+    joint = _joint_counts(dummy_frame, columns)
     min_pairs = profile.options["min_pair_count"]
     records = []
-    for i in range(len(labels)):
-        for j in range(i + 1, len(labels)):
-            a, b = labels[i], labels[j]
-            pv = dep.observed.matrix[i][j]
-            if pv is None or dep.observed.n_pairs[i][j] < min_pairs:
-                continue
-            di, dj = d_labels.get(a.key), d_labels.get(b.key)
-            if di is None or dj is None:
-                continue
-            dv = d_dep.observed.matrix[di][dj]
-            n_pairs = d_dep.observed.n_pairs[di][dj]
-            if dv is None or n_pairs < min_pairs:
-                continue
-            pl, dl = dep.latent.matrix[i][j], d_dep.latent.matrix[di][dj]
-            records.append({
-                "a": a.key, "b": b.key, "column_a": a.column, "column_b": b.column,
-                "kind": _pair_kind(_label_kind(profile, a.column),
-                                   _label_kind(profile, b.column)),
-                "profile": pv, "dummy": dv, "abs_diff": abs(dv - pv),
-                "profile_latent": pl, "dummy_latent": dl,
-                "latent_abs_diff": None if pl is None or dl is None else abs(dl - pl),
-                "n_pairs_dummy": int(n_pairs),
-                # approximate sampling SE of the dummy's estimate (latent Gaussian model)
-                "se": (1 - pl**2 if pl is not None else 1.0)
-                / math.sqrt(max(n_pairs * eff[i] * eff[j], 1.0)),
-            })
+    for i, j, pl_, pv in dep.pairs:
+        a, b = labels[i], labels[j]
+        found = d_pairs.get((a.key, b.key))
+        if found is None:
+            continue
+        dl, dv = found
+        n_pairs = joint[col_index[a.column], col_index[b.column]]
+        if n_pairs < min_pairs:
+            continue
+        records.append({
+            "a": a.key, "b": b.key, "column_a": a.column, "column_b": b.column,
+            "kind": _pair_kind(_label_kind(profile, a.column),
+                               _label_kind(profile, b.column)),
+            "profile": pv, "dummy": dv, "abs_diff": abs(dv - pv),
+            "profile_latent": pl_, "dummy_latent": dl,
+            "latent_abs_diff": abs(dl - pl_),
+            "n_pairs_dummy": int(n_pairs),
+            # approximate sampling SE of the dummy's estimate (latent Gaussian model)
+            "se": (1 - pl_**2) / math.sqrt(max(n_pairs * eff[i] * eff[j], 1.0)),
+        })
     return records
 
 
@@ -531,15 +546,16 @@ def compare(profile: Profile, dummy: pl.DataFrame | pl.LazyFrame, *,
         opts = profile.options
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            frame = _dummy_for_reprofile(profile, dummy, inverse)
             dummy_profile = profile_dataframe(
-                _dummy_for_reprofile(profile, dummy, inverse),
-                types=_reprofile_types(profile, dummy), rare_threshold=1,
+                frame, types=_reprofile_types(profile, dummy), rare_threshold=1,
                 min_tail_count=opts["min_tail_count"], quantile_grid=opts["quantile_grid"],
                 discrete_max_levels=opts["discrete_max_levels"],
                 max_levels=max(opts["max_levels"], _max_levels(profile)),
                 ordinal_max_levels=opts["ordinal_max_levels"],
-                min_pair_count=opts["min_pair_count"])
-        correlations = _correlations(profile, dummy_profile)
+                min_pair_count=opts["min_pair_count"], correlation_threshold=0.0,
+                correlation_decimals=12)
+        correlations = _correlations(profile, dummy_profile, prepare(frame))
 
     expected = profile.output_columns
     return CompareReport(n_rows=n, expected_columns=list(expected),

@@ -139,7 +139,7 @@ def test_date_and_time_dependence_is_estimated(rng) -> None:
     ts = [base + dt.timedelta(days=int(d), seconds=int(s)) for d, s in zip(days, secs,
                                                                          strict=True)]
     p = quiet_profile(pl.DataFrame({"t": ts}))
-    assert p.dependence.latent.matrix[0][1] == pytest.approx(0.6, abs=0.04)
+    assert p.dependence.latent_matrix()[0, 1] == pytest.approx(0.6, abs=0.04)
     out = generate(p, seed=0)["t"]
     d = date_time_parts(out)
     assert np.corrcoef(d[0], d[1])[0, 1] == pytest.approx(np.corrcoef(days, secs)[0, 1],

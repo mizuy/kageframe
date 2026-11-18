@@ -2,6 +2,7 @@ import copy
 import json
 import warnings
 
+import numpy as np
 import pytest
 
 from conftest import build_example_columns, build_example_profile
@@ -221,44 +222,66 @@ def test_latent_labels_skip_columns_without_latent():
     assert names.isdisjoint({"patient_id", "note", "site", "unused", "dropped"})
 
 
-def test_dependence_label_mismatch(example_profile):
+def test_dependence_dim_mismatch(example_profile):
     d = example_profile.to_dict()
-    d["dependence"]["latent"]["labels"].reverse()
-    with pytest.raises(ProfileSchemaError, match="labels do not match"):
+    d["dependence"]["dim"] += 1
+    with pytest.raises(ProfileSchemaError, match="latent dimensions"):
         Profile.from_dict(d)
 
 
 def test_latent_nominal_block_must_be_identity(example_profile):
     d = example_profile.to_dict()
-    m = d["dependence"]["latent"]["matrix"]
-    m[4][5] = m[5][4] = 0.1
+    d["dependence"]["pairs"].insert(1, [4, 5, 0.1, 0.1])
+    d["dependence"]["pairs"].sort()
     with pytest.raises(ProfileSchemaError, match="uncorrelated"):
         Profile.from_dict(d)
 
 
-def test_matrix_structure_checks(example_profile):
+def test_pair_structure_checks(example_profile):
+    def broken(change):
+        d = example_profile.to_dict()
+        change(d["dependence"])
+        return d
+
+    def bad_order(dep):
+        dep["pairs"].reverse()
+
+    cases = [
+        (lambda dep: dep["pairs"][0].__setitem__(2, 1.5), "outside"),
+        (lambda dep: dep["pairs"][0].__setitem__(0, 99), "indices"),
+        (lambda dep: dep["pairs"].append(list(dep["pairs"][-1])), "sorted"),
+        (bad_order, "sorted"),
+        (lambda dep: dep["pairs"][0].pop(), r"\[i, j, latent, observed\]"),
+        (lambda dep: dep.__setitem__("independent", ["age"]), "independent column"),
+        (lambda dep: dep.__setitem__("independent", ["note"]), "latent dimension"),
+        (lambda dep: dep.pop("pairs"), "pairs"),
+    ]
+    for change, match in cases:
+        with pytest.raises(ProfileSchemaError, match=match):
+            Profile.from_dict(broken(change))
+
+
+def test_schema_02_dense_matrices_are_rejected(example_profile):
     d = example_profile.to_dict()
-    d["dependence"]["latent"]["matrix"][0][1] = 0.9
-    with pytest.raises(ProfileSchemaError, match="symmetric"):
+    d["dependence"]["latent"] = {"labels": [], "matrix": []}
+    with pytest.raises(ProfileSchemaError, match="re-create the profile"):
         Profile.from_dict(d)
-    d = example_profile.to_dict()
-    d["dependence"]["latent"]["matrix"][0][0] = 0.9
-    with pytest.raises(ProfileSchemaError, match="diagonal"):
-        Profile.from_dict(d)
-    d = example_profile.to_dict()
-    d["dependence"]["observed"]["matrix"][0][1] = None
-    d["dependence"]["observed"]["matrix"][1][0] = None
-    with pytest.raises(ProfileSchemaError, match="null is only allowed"):
-        Profile.from_dict(d)
-    d = example_profile.to_dict()
-    d["dependence"]["latent"]["matrix"][0][1] = 1.5
-    d["dependence"]["latent"]["matrix"][1][0] = 1.5
-    with pytest.raises(ProfileSchemaError, match="outside"):
-        Profile.from_dict(d)
-    d = example_profile.to_dict()
-    del d["dependence"]["observed"]["n_pairs"]
-    with pytest.raises(ProfileSchemaError, match="n_pairs"):
-        Profile.from_dict(d)
+
+
+def test_dense_matrices_from_pairs(example_profile):
+    dep = example_profile.dependence
+    lat, obs = dep.latent_matrix(), dep.observed_matrix()
+    keys = [lb.key for lb in example_profile.latent_labels()]
+    i, j = keys.index("age"), keys.index("ecog")
+    assert lat[i, j] == lat[j, i] == 0.35 and obs[i, j] == 0.35
+    k = keys.index("visit_time")
+    assert lat[i, k] == 0.0 and np.isnan(obs[i, k])
+
+
+def test_saved_json_keeps_number_lists_on_one_line(example_profile):
+    text = example_profile.to_json()
+    assert '"pairs": [\n      [0, 3, 0.35, 0.35],' in text
+    assert json.loads(text) == example_profile.to_dict()
 
 
 def test_profile_without_dependence_roundtrips():
